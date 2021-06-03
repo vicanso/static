@@ -9,7 +9,7 @@ RUN apk update \
 
 FROM alpine 
 
-EXPOSE 7001
+EXPOSE 3000
 
 # tzdata 安装所有时区配置或可根据需要只添加所需时区
 
@@ -28,6 +28,6 @@ WORKDIR /home/go
 
 HEALTHCHECK --timeout=10s --interval=10s CMD [ "wget", "http://127.0.0.1:3000/ping", "-q", "-O", "-"]
 
-CMD ["forest"]
+CMD ["static"]
 
 ENTRYPOINT ["/entrypoint.sh"]
