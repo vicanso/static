@@ -13,6 +13,9 @@ func main() {
 	staticPath := os.Getenv("STATIC")
 	e := elton.New()
 
+	e.Use(middleware.NewLogger(middleware.LoggerConfig{
+		Format: middleware.LoggerCombined,
+	}))
 	e.Use(middleware.NewDefaultCompress())
 
 	sf := new(middleware.FS)
