@@ -21,6 +21,8 @@ func main() {
 		},
 		Format: middleware.LoggerCombined,
 	}))
+	e.Use(middleware.NewDefaultFresh())
+	e.Use(middleware.NewDefaultETag())
 	e.Use(middleware.NewDefaultCompress())
 
 	sf := new(middleware.FS)
