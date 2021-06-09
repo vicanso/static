@@ -5,6 +5,8 @@ import (
 	"os"
 	"time"
 
+	"log"
+
 	"github.com/vicanso/elton"
 	"github.com/vicanso/elton/middleware"
 )
@@ -14,6 +16,9 @@ func main() {
 	e := elton.New()
 
 	e.Use(middleware.NewLogger(middleware.LoggerConfig{
+		OnLog: func(s string, c *elton.Context) {
+			log.Println(s)
+		},
 		Format: middleware.LoggerCombined,
 	}))
 	e.Use(middleware.NewDefaultCompress())
