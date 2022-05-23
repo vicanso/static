@@ -10,7 +10,6 @@ import (
 	"log"
 
 	"github.com/vicanso/elton"
-	compress "github.com/vicanso/elton-compress"
 	"github.com/vicanso/elton/middleware"
 )
 
@@ -31,7 +30,7 @@ func main() {
 	e.Use(middleware.NewDefaultETag())
 	if compressLevel != 0 {
 		config := middleware.NewCompressConfig(
-			&compress.BrCompressor{
+			&middleware.BrCompressor{
 				MinLength: minLength,
 				Level:     compressLevel,
 			},
@@ -64,11 +63,9 @@ func main() {
 		// 客户端缓存一年
 		MaxAge: 365 * 24 * time.Hour,
 		// 缓存服务器缓存一个小时
-		SMaxAge:             time.Hour,
-		DenyQueryString:     true,
-		DisableLastModified: true,
-		// 如果使用内存式文件存储，不支持Stat，因此需要用强ETag
-		EnableStrongETag: true,
+		SMaxAge: time.Hour,
+		// 禁止访问隐藏文件
+		DenyDot: true,
 	}))
 
 	err := e.ListenAndServe(":3000")
