@@ -20,6 +20,8 @@ RUN addgroup -g 1000 go \
 COPY --from=builder /static/static /usr/local/bin/static
 COPY --from=builder /static/entrypoint.sh /entrypoint.sh
 
+RUN rm /usr/local/bin/static
+
 USER go
 
 ENV STATIC=/static
