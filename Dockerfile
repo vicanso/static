@@ -15,7 +15,8 @@ EXPOSE 3000
 
 RUN addgroup -g 1000 go \
   && adduser -u 1000 -G go -s /bin/sh -D go \
-  && apk add --no-cache tzdata
+  && apk add --no-cache tzdata \
+  && rm /lib/ld-musl-aarch64.so.1
 
 COPY --from=builder /static/static /usr/local/bin/static
 COPY --from=builder /static/entrypoint.sh /entrypoint.sh
