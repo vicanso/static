@@ -51,11 +51,12 @@ func main() {
 		OnLog: func(s string, _ *elton.Context) {
 			log.Println(s)
 		},
-		Format: middleware.LoggerCombined,
+		Format: `{remote} {when-iso} "{method} {uri} {proto}" {status} {size-human} - {latency-ms}ms "{referer}" "{userAgent}"`,
 	}))
 	e.Use(middleware.NewDefaultFresh())
 
 	var compressor middleware.CacheCompressor
+	// 基本全部浏览器均支持br
 	if compressLevel != 0 {
 		compressor = &middleware.CacheBrCompressor{
 			Level:         compressLevel,
@@ -84,6 +85,7 @@ func main() {
 		if err != nil {
 			return
 		}
+		c.NoCache()
 		c.SetContentTypeByExt(".html")
 		c.Body = r
 		return
@@ -99,6 +101,7 @@ func main() {
 		DenyDot: true,
 		// 启用强ETag
 		EnableStrongETag: true,
+		NoCacheRegexp:    regexp.MustCompile(`.html`),
 	}))
 	msg := fmt.Sprintf("path:%s, compress(level:%d, minLength:%d, contentType:%s)", staticPath, compressLevel, minLength, contentType)
 	log.Println(msg)
