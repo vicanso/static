@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -11,26 +10,9 @@ import (
 
 	"log"
 
-	"github.com/allegro/bigcache/v3"
 	"github.com/vicanso/elton"
 	"github.com/vicanso/elton/middleware"
 )
-
-type httpCache struct {
-	c *bigcache.BigCache
-}
-
-func (hc *httpCache) Get(ctx context.Context, key string) ([]byte, error) {
-	buf, err := hc.c.Get(key)
-	if err != nil && err != bigcache.ErrEntryNotFound {
-		return nil, err
-	}
-	return buf, nil
-}
-
-func (hc *httpCache) Set(ctx context.Context, key string, data []byte, ttl time.Duration) error {
-	return hc.c.Set(key, data)
-}
 
 func main() {
 	staticPath := os.Getenv("STATIC")
@@ -64,14 +46,9 @@ func main() {
 			ContentRegexp: checker,
 		}
 	}
-	// 缓存直接使用10分钟
-	// 静态文件有版本号，10分钟短缓存不影响
-	cache, _ := bigcache.NewBigCache(bigcache.DefaultConfig(cacheTTL))
 
 	e.Use(middleware.NewCache(middleware.CacheConfig{
-		Store: &httpCache{
-			c: cache,
-		},
+		Store:      middleware.NewPeekLruStore(256),
 		Compressor: compressor,
 	}))
 
@@ -105,7 +82,7 @@ func main() {
 	}))
 	msg := fmt.Sprintf("path:%s, compress(level:%d, minLength:%d, contentType:%s)", staticPath, compressLevel, minLength, contentType)
 	log.Println(msg)
-	log.Println("server is running")
+	log.Println("server is running, http://127.0.0.1:3000")
 
 	err := e.ListenAndServe(":3000")
 	if err != nil {
