@@ -22,10 +22,10 @@ COPY --from=builder /static/entrypoint.sh /entrypoint.sh
 
 USER go
 
-ENV STATIC=/static
-ENV CMP_LEVEL=6
-ENV CMP_MIN_LENGTH=1024
-ENV CMP_CONTENT_TYPE="text|javascript|json|wasm|font"
+ENV STATIC_PATH=/static
+ENV STATIC_COMPRESS_LEVEL=6
+ENV STATIC_COMPRESS_MIN_LENGTH=1024
+ENV STATIC_COMPRESS_CONTENT_TYPE="text|javascript|json|wasm|font"
 
 WORKDIR /home/go
 

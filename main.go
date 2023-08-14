@@ -15,26 +15,29 @@ import (
 )
 
 func main() {
-	staticPath := os.Getenv("STATIC")
-	compressLevel, _ := strconv.Atoi(os.Getenv("CMP_LEVEL"))
-	minLength, _ := strconv.Atoi(os.Getenv("CMP_MIN_LENGTH"))
+	staticPath := os.Getenv("STATIC_PATH")
+	compressLevel, _ := strconv.Atoi(os.Getenv("STATIC_COMPRESS_LEVEL"))
+	minLength, _ := strconv.Atoi(os.Getenv("STATIC_COMPRESS_MIN_LENGTH"))
 	var checker *regexp.Regexp
-	contentType := os.Getenv("CMP_CONTENT_TYPE")
+	contentType := os.Getenv("STATIC_COMPRESS_CONTENT_TYPE")
 	if contentType != "" {
 		checker, _ = regexp.Compile(contentType)
 	}
-	cacheTTL, _ := time.ParseDuration(os.Getenv("CACHE_TTL"))
+	cacheTTL, _ := time.ParseDuration(os.Getenv("STATIC_CACHE_TTL"))
 	if cacheTTL == 0 {
 		cacheTTL = 10 * time.Minute
 	}
+	disabledLog := os.Getenv("STATIC_DISABLE_LOG") != ""
 	e := elton.New()
 
-	e.Use(middleware.NewLogger(middleware.LoggerConfig{
-		OnLog: func(s string, _ *elton.Context) {
-			log.Println(s)
-		},
-		Format: `{remote} {when-iso} "{method} {uri} {proto}" {status} {size-human} - {latency-ms}ms "{referer}" "{userAgent}"`,
-	}))
+	if !disabledLog {
+		e.Use(middleware.NewLogger(middleware.LoggerConfig{
+			OnLog: func(s string, _ *elton.Context) {
+				log.Println(s)
+			},
+			Format: `{remote} {when-iso} "{method} {uri} {proto}" {status} {size-human} - {latency-ms}ms "{referer}" "{userAgent}"`,
+		}))
+	}
 	e.Use(middleware.NewDefaultFresh())
 
 	var compressor middleware.CacheCompressor
