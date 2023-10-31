@@ -82,6 +82,7 @@ func main() {
 		// 启用强ETag
 		EnableStrongETag: true,
 		NoCacheRegexp:    regexp.MustCompile(`.html`),
+		IndexFile:        "index.html",
 	}))
 	msg := fmt.Sprintf("path:%s, compress(level:%d, minLength:%d, contentType:%s)", staticPath, compressLevel, minLength, contentType)
 	log.Println(msg)
