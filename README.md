@@ -9,6 +9,10 @@ docker run -d --restart=always \
   vicanso/static
 ```
 
+## TODO
+
+- [ ] 支持目录先压缩，在读取时解压。如先把文件gzip或zstd，再tar打包
+
 ## 环境变量
 
 应用支持通过以下环境变量：
