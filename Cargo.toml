@@ -1,0 +1,11 @@
+[package]
+name = "static-serve"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8.1"
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "fs"] }
+tokio-util = { version = "0.7.13", features = ["io"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
