@@ -1,16 +1,52 @@
-use axum::body::Body;
-use axum::extract::Path;
-use axum::http::header;
-use axum::response::IntoResponse;
-use axum::{routing::get, Router};
-use std::path::PathBuf;
-use std::sync::LazyLock;
-use tokio::fs;
-use tokio_util::io::ReaderStream;
+// Copyright 2025 Tree xie.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-static STATIC_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
-    let path = std::env::var("STATIC_PATH").unwrap_or("/static".to_string());
-    PathBuf::from(path)
+use crate::error::{handle_error, Result};
+use axum::error_handling::HandleErrorLayer;
+use axum::http::Uri;
+use axum::response::Response;
+use axum::{routing::get, Router};
+use serve::{static_serve, StaticServeParams};
+use std::sync::LazyLock;
+use std::time::Duration;
+use substring::Substring;
+use tower::ServiceBuilder;
+use tower_http::compression::predicate::SizeAbove;
+use tower_http::compression::CompressionLayer;
+
+mod error;
+mod serve;
+
+static STATIC_PATH: LazyLock<String> =
+    LazyLock::new(|| std::env::var("STATIC_PATH").unwrap_or("/static".to_string()));
+
+static STATIC_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let timeout = std::env::var("STATIC_TIMEOUT").unwrap_or("30s".to_string());
+    humantime::parse_duration(&timeout).unwrap_or(Duration::from_secs(30))
+});
+
+static STATIC_COMPRESS_MIN_LENGTH: LazyLock<u16> = LazyLock::new(|| {
+    let min_length = std::env::var("STATIC_COMPRESS_MIN_LENGTH").unwrap_or("256".to_string());
+    min_length.parse::<u16>().unwrap_or(256)
+});
+
+static STATIC_INDEX_FILE: LazyLock<String> =
+    LazyLock::new(|| std::env::var("STATIC_INDEX_FILE").unwrap_or_default());
+
+static STATIC_AUTOINDEX: LazyLock<bool> = LazyLock::new(|| {
+    let autoindex = std::env::var("STATIC_AUTOINDEX").unwrap_or("false".to_string());
+    autoindex.parse::<bool>().unwrap_or(false)
 });
 
 #[tokio::main]
@@ -19,7 +55,20 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/{*file}", get(serve));
+        .fallback(get(serve));
+
+    let builder = ServiceBuilder::new();
+    let builder = builder.layer(HandleErrorLayer::new(handle_error));
+    let size = *STATIC_COMPRESS_MIN_LENGTH;
+    let app = if size > 0 {
+        app.layer(
+            builder
+                .layer(CompressionLayer::new().compress_when(SizeAbove::new(size)))
+                .timeout(*STATIC_TIMEOUT),
+        )
+    } else {
+        app.layer(builder.timeout(*STATIC_TIMEOUT))
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
@@ -30,19 +79,20 @@ async fn main() {
 }
 
 // 处理函数
-async fn serve(Path(file): Path<String>) -> impl IntoResponse {
-    let path = STATIC_PATH.join(file);
-    println!("path:{path:?}");
-    let meta = fs::metadata(&path).await.unwrap();
-    let file = fs::OpenOptions::new().read(true).open(path).await.unwrap();
-    let stream = ReaderStream::new(file);
-
-    let body = Body::from_stream(stream);
-
-    let headers = [(header::CONTENT_TYPE, "text/html")];
-
-    println!("file:{meta:?}");
-    (headers, body)
+async fn serve(uri: Uri) -> Result<Response> {
+    let path = uri.path();
+    let file = if !path.is_empty() {
+        path.substring(1, path.len()).to_string()
+    } else {
+        path.to_string()
+    };
+    static_serve(StaticServeParams {
+        dir: STATIC_PATH.clone(),
+        index: STATIC_INDEX_FILE.clone(),
+        autoindex: *STATIC_AUTOINDEX,
+        file,
+    })
+    .await
 }
 
 async fn health_check() -> &'static str {
