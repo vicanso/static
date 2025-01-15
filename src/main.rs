@@ -24,6 +24,7 @@ use substring::Substring;
 use tower::ServiceBuilder;
 use tower_http::compression::predicate::SizeAbove;
 use tower_http::compression::CompressionLayer;
+use tracing::info;
 
 mod error;
 mod serve;
@@ -49,6 +50,9 @@ static STATIC_AUTOINDEX: LazyLock<bool> = LazyLock::new(|| {
     autoindex.parse::<bool>().unwrap_or(false)
 });
 
+static STATIC_LISTEN_ADDR: LazyLock<String> =
+    LazyLock::new(|| std::env::var("STATIC_LISTEN_ADDR").unwrap_or("127.0.0.1:3000".to_string()));
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -70,10 +74,10 @@ async fn main() {
         app.layer(builder.timeout(*STATIC_TIMEOUT))
     };
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let listener = tokio::net::TcpListener::bind(STATIC_LISTEN_ADDR.as_str())
         .await
         .unwrap();
-    tracing::info!("Server running on http://127.0.0.1:3000");
+    info!("Server running on http://{}", STATIC_LISTEN_ADDR.as_str());
 
     axum::serve(listener, app).await.unwrap();
 }
@@ -85,6 +89,11 @@ async fn serve(uri: Uri) -> Result<Response> {
         path.substring(1, path.len()).to_string()
     } else {
         path.to_string()
+    };
+    let file = if let Ok(file) = urlencoding::decode(&file) {
+        file.to_string()
+    } else {
+        file
     };
     static_serve(StaticServeParams {
         dir: STATIC_PATH.clone(),

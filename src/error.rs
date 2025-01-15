@@ -49,15 +49,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        // let status = match StatusCode::from_u16(self.status) {
-        //     Ok(status) => status,
-        //     Err(_) => StatusCode::BAD_REQUEST,
-        // };
-        // 对于出错设置为no-cache
-        let mut res = self.to_string().into_response();
+        let (status, message) = match self {
+            Error::Unknown { message } => (StatusCode::INTERNAL_SERVER_ERROR, message),
+            Error::NotFound { file } => (StatusCode::NOT_FOUND, format!("{file} not found")),
+            Error::Timeout => (StatusCode::REQUEST_TIMEOUT, "request timeout".to_string()),
+            _ => (StatusCode::BAD_REQUEST, self.to_string()),
+        };
+        let mut res = message.into_response();
         res.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        (StatusCode::BAD_REQUEST, res).into_response()
+        (status, res).into_response()
     }
 }
 
@@ -75,5 +76,4 @@ pub async fn handle_error(
     Error::Unknown {
         message: err.to_string(),
     }
-    // HttpError::new(&err.to_string())
 }

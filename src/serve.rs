@@ -14,9 +14,8 @@
 
 use crate::error::{Error, Result};
 use axum::body::Body;
-use axum::http::header;
-use axum::http::HeaderValue;
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{header, HeaderName, HeaderValue};
+use axum::response::{IntoResponse, Response};
 use bytesize::ByteSize;
 use glob::glob;
 use std::os::unix::fs::MetadataExt;
@@ -129,6 +128,7 @@ fn get_autoindex_html(path: &Path) -> Result<String> {
     Ok(WEB_HTML.replace("{{CONTENT}}", &file_list_html.join("\n")))
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct StaticServeParams {
     pub dir: String,
     pub file: String,
@@ -136,9 +136,14 @@ pub struct StaticServeParams {
     pub autoindex: bool,
 }
 
-// 处理函数
-pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
-    let file = params.file;
+pub struct FileInfo {
+    pub headers: Vec<(HeaderName, String)>,
+    pub path: PathBuf,
+    pub body: Option<Vec<u8>>,
+}
+
+async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
+    let file = &params.file;
     let dir = PathBuf::from(&params.dir);
     let mut path = dir.join(&file);
     if path.to_string_lossy().len() < params.dir.len() {
@@ -155,9 +160,16 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
     if is_dir && !params.autoindex && params.index.is_empty() {
         return Err(Error::NotFound { file: file.clone() });
     }
+    let mut headers = vec![];
+
     if is_dir && params.autoindex {
         let html = get_autoindex_html(path.as_path())?;
-        return Ok(Html(html).into_response());
+        headers.push((header::CONTENT_TYPE, "text/html".to_string()));
+        return Ok(FileInfo {
+            headers,
+            path,
+            body: Some(html.into_bytes()),
+        });
     }
     if is_dir && !params.index.is_empty() {
         path = path.join(&params.index);
@@ -166,12 +178,11 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
             file: file.clone(),
         })?;
     }
-
     let guess = mime_guess::from_path(&path);
-    let mut headers = vec![(
+    headers.push((
         header::CONTENT_TYPE,
         guess.first_or_octet_stream().to_string(),
-    )];
+    ));
 
     let size = meta.size();
     // Generate ETag based on file size and modification time
@@ -185,18 +196,44 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
             headers.push((header::ETAG, etag));
         }
     }
+    let body = if size < 30 * 1024 {
+        Some(fs::read(&path).await.map_err(|e| Error::Io {
+            source: e,
+            file: params.file.clone(),
+        })?)
+    } else {
+        None
+    };
+
+    Ok(FileInfo {
+        headers,
+        path,
+        body,
+    })
+}
+
+// 处理函数
+pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
+    let file_info = get_file(&params).await?;
 
     let file = fs::OpenOptions::new()
         .read(true)
-        .open(path)
+        .open(file_info.path)
         .await
-        .map_err(|e| Error::Io { source: e, file })?;
+        .map_err(|e| Error::Io {
+            source: e,
+            file: params.file.clone(),
+        })?;
 
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    let mut resp = if let Some(body) = file_info.body {
+        body.into_response()
+    } else {
+        let stream = ReaderStream::new(file);
+        let body = Body::from_stream(stream);
+        body.into_response()
+    };
 
-    let mut resp = body.into_response();
-    headers.iter().for_each(|(k, v)| {
+    file_info.headers.iter().for_each(|(k, v)| {
         let Ok(value) = HeaderValue::from_str(v) else {
             return;
         };
