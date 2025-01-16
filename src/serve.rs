@@ -21,7 +21,9 @@ use glob::glob;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tinyufo::TinyUfo;
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 
@@ -134,18 +136,78 @@ pub struct StaticServeParams {
     pub file: String,
     pub index: String,
     pub autoindex: bool,
+    pub cache_control: String,
 }
 
-pub struct FileInfo {
-    pub headers: Vec<(HeaderName, String)>,
-    pub path: PathBuf,
-    pub body: Option<Vec<u8>>,
+#[derive(Clone)]
+struct FileInfoCache {
+    expired_at: u64,
+    data: FileInfo,
+}
+
+#[derive(Clone)]
+struct FileInfo {
+    headers: Vec<(HeaderName, String)>,
+    path: PathBuf,
+    body: Option<Vec<u8>>,
+}
+
+static STATIC_CACHE_TTL: LazyLock<Duration> = LazyLock::new(|| {
+    let value = std::env::var("STATIC_CACHE_TTL").unwrap_or("10m".to_string());
+    humantime::parse_duration(&value).unwrap_or(Duration::from_secs(10 * 60))
+});
+
+static STATIC_CACHE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let value = std::env::var("STATIC_CACHE_SIZE").unwrap_or("1024".to_string());
+    value.parse::<usize>().unwrap_or(1024)
+});
+
+static STATIC_CACHE: LazyLock<TinyUfo<String, FileInfoCache>> =
+    LazyLock::new(|| TinyUfo::new(*STATIC_CACHE_SIZE, *STATIC_CACHE_SIZE));
+
+fn get_file_from_cache(file: &String) -> Option<FileInfo> {
+    if *STATIC_CACHE_SIZE == 0 {
+        return None;
+    }
+    if let Some(info) = STATIC_CACHE.get(file) {
+        if info.expired_at
+            > SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        {
+            return Some(info.data.clone());
+        }
+    }
+    None
+}
+
+fn set_file_to_cache(file: &str, info: &FileInfo) {
+    if *STATIC_CACHE_SIZE == 0 {
+        return;
+    }
+    let expired_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + STATIC_CACHE_TTL.as_secs();
+    STATIC_CACHE.put(
+        file.to_string(),
+        FileInfoCache {
+            expired_at,
+            data: info.clone(),
+        },
+        1,
+    );
 }
 
 async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     let file = &params.file;
+    if let Some(info) = get_file_from_cache(file) {
+        return Ok(info);
+    }
     let dir = PathBuf::from(&params.dir);
-    let mut path = dir.join(&file);
+    let mut path = dir.join(file);
     if path.to_string_lossy().len() < params.dir.len() {
         return Err(Error::Unknown {
             message: "access parent directory is not allowed".to_string(),
@@ -165,6 +227,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     if is_dir && params.autoindex {
         let html = get_autoindex_html(path.as_path())?;
         headers.push((header::CONTENT_TYPE, "text/html".to_string()));
+        headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
         return Ok(FileInfo {
             headers,
             path,
@@ -178,11 +241,16 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             file: file.clone(),
         })?;
     }
-    let guess = mime_guess::from_path(&path);
-    headers.push((
-        header::CONTENT_TYPE,
-        guess.first_or_octet_stream().to_string(),
-    ));
+    let content_type = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .to_string();
+    if content_type.contains("text/html") {
+        headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
+    } else {
+        headers.push((header::CACHE_CONTROL, params.cache_control.clone()));
+    }
+
+    headers.push((header::CONTENT_TYPE, content_type));
 
     let size = meta.size();
     // Generate ETag based on file size and modification time
@@ -204,12 +272,16 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     } else {
         None
     };
-
-    Ok(FileInfo {
+    let info = FileInfo {
         headers,
         path,
         body,
-    })
+    };
+    if info.body.is_some() {
+        set_file_to_cache(file, &info);
+    }
+
+    Ok(info)
 }
 
 // 处理函数

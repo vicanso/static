@@ -53,6 +53,11 @@ static STATIC_AUTOINDEX: LazyLock<bool> = LazyLock::new(|| {
 static STATIC_LISTEN_ADDR: LazyLock<String> =
     LazyLock::new(|| std::env::var("STATIC_LISTEN_ADDR").unwrap_or("127.0.0.1:3000".to_string()));
 
+static STATIC_CACHE_CONTROL: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("STATIC_CACHE_CONTROL")
+        .unwrap_or("public, max-age=31536000, immutable".to_string())
+});
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -99,6 +104,7 @@ async fn serve(uri: Uri) -> Result<Response> {
         dir: STATIC_PATH.clone(),
         index: STATIC_INDEX_FILE.clone(),
         autoindex: *STATIC_AUTOINDEX,
+        cache_control: STATIC_CACHE_CONTROL.clone(),
         file,
     })
     .await
