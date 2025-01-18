@@ -45,7 +45,7 @@ jobs:
           images: |
             vicanso/static
           tags: |
-            type=semver,pattern={{version}}
+            type=raw,value=latest
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx

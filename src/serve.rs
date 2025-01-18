@@ -244,7 +244,9 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     let content_type = mime_guess::from_path(&path)
         .first_or_octet_stream()
         .to_string();
+    let mut is_html = false;
     if content_type.contains("text/html") {
+        is_html = true;
         headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
     } else {
         headers.push((header::CACHE_CONTROL, params.cache_control.clone()));
@@ -277,7 +279,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         path,
         body,
     };
-    if info.body.is_some() {
+    if !is_html && info.body.is_some() {
         set_file_to_cache(file, &info);
     }
 

@@ -43,7 +43,7 @@ static STATIC_COMPRESS_MIN_LENGTH: LazyLock<u16> = LazyLock::new(|| {
 });
 
 static STATIC_INDEX_FILE: LazyLock<String> =
-    LazyLock::new(|| std::env::var("STATIC_INDEX_FILE").unwrap_or_default());
+    LazyLock::new(|| std::env::var("STATIC_INDEX_FILE").unwrap_or("index.html".to_string()));
 
 static STATIC_AUTOINDEX: LazyLock<bool> = LazyLock::new(|| {
     let autoindex = std::env::var("STATIC_AUTOINDEX").unwrap_or("false".to_string());
