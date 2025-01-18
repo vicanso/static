@@ -58,6 +58,18 @@ static STATIC_CACHE_CONTROL: LazyLock<String> = LazyLock::new(|| {
         .unwrap_or("public, max-age=31536000, immutable".to_string())
 });
 
+static STATIC_HTML_REPLACES: LazyLock<Vec<(Vec<u8>, Vec<u8>)>> = LazyLock::new(|| {
+    let prefix = "STATIC_HTML_REPLACE_";
+    let mut values = vec![];
+    for (key, value) in std::env::vars() {
+        if key.starts_with(prefix) {
+            let key = key.substring(prefix.len(), key.len());
+            values.push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
+        }
+    }
+    values
+});
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -105,6 +117,7 @@ async fn serve(uri: Uri) -> Result<Response> {
         index: STATIC_INDEX_FILE.clone(),
         autoindex: *STATIC_AUTOINDEX,
         cache_control: STATIC_CACHE_CONTROL.clone(),
+        html_replaces: STATIC_HTML_REPLACES.clone(),
         file,
     })
     .await

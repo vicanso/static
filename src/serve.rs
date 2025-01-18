@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use axum::body::Body;
 use axum::http::{header, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
+use bstr::ByteSlice;
 use bytesize::ByteSize;
 use glob::glob;
 use std::os::unix::fs::MetadataExt;
@@ -137,6 +138,7 @@ pub struct StaticServeParams {
     pub index: String,
     pub autoindex: bool,
     pub cache_control: String,
+    pub html_replaces: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Clone)]
@@ -266,11 +268,16 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             headers.push((header::ETAG, etag));
         }
     }
-    let body = if size < 30 * 1024 {
-        Some(fs::read(&path).await.map_err(|e| Error::Io {
+    // read html or small file
+    let body = if is_html || size < 30 * 1024 {
+        let mut buf = fs::read(&path).await.map_err(|e| Error::Io {
             source: e,
             file: params.file.clone(),
-        })?)
+        })?;
+        for (key, value) in params.html_replaces.iter() {
+            buf = buf.replace(key, value);
+        }
+        Some(buf)
     } else {
         None
     };
