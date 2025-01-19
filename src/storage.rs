@@ -15,7 +15,10 @@
 use crate::error::Error;
 use once_cell::sync::OnceCell;
 use opendal::layers::MimeGuessLayer;
+use std::collections::HashMap;
 use url::Url;
+
+type Result<T> = std::result::Result<T, Error>;
 
 pub struct Storage {
     pub dal: opendal::Operator,
@@ -23,48 +26,51 @@ pub struct Storage {
 
 static STORAGE: OnceCell<Storage> = OnceCell::new();
 
-fn new_s3_dal(url: &str) -> Result<Storage, Error> {
+struct StorageParams {
+    endpoint: String,
+    path: String,
+    query: HashMap<String, String>,
+}
+
+fn parse_params(url: &str) -> Result<StorageParams> {
     let info = Url::parse(url).map_err(|e| Error::ParseUrl { source: e })?;
-    let mut builder = opendal::services::S3::default();
-    if let Some(host) = info.host() {
-        builder = builder.endpoint(&format!("{}://{}", info.scheme(), host));
+    let mut endpoint = format!(
+        "{}://{}",
+        info.scheme(),
+        info.host().map(|v| v.to_string()).unwrap_or_default()
+    );
+    if let Some(port) = info.port() {
+        endpoint = format!("{}:{}", endpoint, port);
     }
-    let path = info.path();
-    if !path.is_empty() {
-        builder = builder.root(path);
-    }
-    let mut bucket = "".to_string();
-    let mut region = "".to_string();
-    let mut access_key_id = "".to_string();
-    let mut secret_access_key = "".to_string();
+    let mut query = HashMap::new();
     info.query_pairs().for_each(|(k, v)| {
-        match k.to_string().as_str() {
-            "bucket" => {
-                bucket = v.to_string();
-            }
-            "region" => {
-                region = v.to_string();
-            }
-            "access_key_id" => {
-                access_key_id = v.to_string();
-            }
-            "secret_access_key" => {
-                secret_access_key = v.to_string();
-            }
-            _ => {}
-        };
+        query.insert(k.to_string(), v.to_string());
     });
-    if !bucket.is_empty() {
-        builder = builder.bucket(&bucket);
+
+    Ok(StorageParams {
+        endpoint,
+        path: info.path().to_string(),
+        query,
+    })
+}
+
+fn new_s3_dal(url: &str) -> Result<Storage> {
+    let params = parse_params(url)?;
+    let mut builder = opendal::services::S3::default().endpoint(&params.endpoint);
+    if !params.path.is_empty() {
+        builder = builder.root(&params.path);
     }
-    if !region.is_empty() {
-        builder = builder.region(&region);
+    if let Some(bucket) = params.query.get("bucket") {
+        builder = builder.bucket(bucket);
     }
-    if !access_key_id.is_empty() {
-        builder = builder.access_key_id(&access_key_id);
+    if let Some(region) = params.query.get("region") {
+        builder = builder.region(region);
     }
-    if !secret_access_key.is_empty() {
-        builder = builder.secret_access_key(&secret_access_key);
+    if let Some(access_key_id) = params.query.get("access_key_id") {
+        builder = builder.access_key_id(access_key_id);
+    }
+    if let Some(secret_access_key) = params.query.get("secret_access_key") {
+        builder = builder.secret_access_key(secret_access_key);
     }
 
     let dal = opendal::Operator::new(builder)
@@ -74,12 +80,32 @@ fn new_s3_dal(url: &str) -> Result<Storage, Error> {
     Ok(Storage { dal })
 }
 
-pub fn get_storage() -> Result<&'static Storage, Error> {
+fn new_ftp_dal(url: &str) -> Result<Storage> {
+    let params = parse_params(url)?;
+    let mut builder = opendal::services::Ftp::default().endpoint(&params.endpoint);
+    if !params.path.is_empty() {
+        builder = builder.root(&params.path);
+    }
+    if let Some(user) = params.query.get("user") {
+        builder = builder.user(user);
+    }
+    if let Some(password) = params.query.get("password") {
+        builder = builder.password(password);
+    }
+    let dal = opendal::Operator::new(builder)
+        .map_err(|e| Error::Openedal { source: e })?
+        .layer(MimeGuessLayer::default())
+        .finish();
+    Ok(Storage { dal })
+}
+
+pub fn get_storage() -> Result<&'static Storage> {
     let storage = STORAGE.get_or_try_init(|| {
         let static_service = std::env::var("STATIC_SERVICE").unwrap_or_default();
         let static_path = std::env::var("STATIC_PATH").unwrap_or("/static".to_string());
         match static_service.as_str() {
             "s3" => new_s3_dal(&static_path),
+            "ftp" => new_ftp_dal(&static_path),
             _ => {
                 let opendal = opendal::services::Fs::default().root(static_path.as_str());
                 let dal = opendal::Operator::new(opendal)
