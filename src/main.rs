@@ -28,9 +28,7 @@ use tracing::info;
 
 mod error;
 mod serve;
-
-static STATIC_PATH: LazyLock<String> =
-    LazyLock::new(|| std::env::var("STATIC_PATH").unwrap_or("/static".to_string()));
+mod storage;
 
 static STATIC_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     let timeout = std::env::var("STATIC_TIMEOUT").unwrap_or("30s".to_string());
@@ -113,7 +111,6 @@ async fn serve(uri: Uri) -> Result<Response> {
         file
     };
     static_serve(StaticServeParams {
-        dir: STATIC_PATH.clone(),
         index: STATIC_INDEX_FILE.clone(),
         autoindex: *STATIC_AUTOINDEX,
         cache_control: STATIC_CACHE_CONTROL.clone(),

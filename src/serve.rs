@@ -13,19 +13,17 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use crate::storage::get_storage;
 use axum::body::Body;
 use axum::http::{header, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use bstr::ByteSlice;
 use bytesize::ByteSize;
-use glob::glob;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
-use tokio::fs;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
 // Static HTML template for directory listing view
@@ -65,8 +63,16 @@ static WEB_HTML: &str = r###"<!doctype html>
         </style>
         <script type="text/javascript">
         function updateAllLastModified() {
-            Array.from(document.getElementsByClassName("lastModified")).forEach((item) => {
-                const date = new Date(item.innerHTML * 1000);
+            Array.from(document.getElementsByClassName("lastModified")).forEach((item, index) => {
+                if (index == 0) {
+                    return;
+                }
+                const ts = item.innerHTM;
+                if (!ts) {
+                    item.innerHTML = "--";
+                    return;
+                }
+                const date = new Date(ts * 1000);
                 if (isFinite(date)) {
                     item.innerHTML = date.toLocaleString();
                 }
@@ -92,33 +98,32 @@ static WEB_HTML: &str = r###"<!doctype html>
 </html>
 "###;
 
-fn get_autoindex_html(path: &Path) -> Result<String> {
-    let path = path.to_string_lossy();
+async fn get_autoindex_html(path: &str) -> Result<String> {
     let mut file_list_html = vec![];
-    for entry in glob(&format!("{path}/*")).map_err(|e| Error::Pattern { source: e })? {
-        let f = entry.map_err(|e| Error::Glob { source: e })?;
-        let filepath = f.to_string_lossy();
-        let mut size = "".to_string();
-        let mut last_modified = "".to_string();
-        let mut is_file = false;
-        if f.is_file() {
-            is_file = true;
-            #[cfg(unix)]
-            let _ = f.metadata().map(|meta| {
-                size = ByteSize(meta.size()).to_string();
-                last_modified = meta.mtime().to_string();
-            });
-        }
-
-        let name = f.file_name().unwrap_or_default().to_string_lossy();
-        if name.is_empty() || name.starts_with('.') {
+    let entry_list = get_storage()?
+        .dal
+        .list(path)
+        .await
+        .map_err(|e| Error::Openedal { source: e })?;
+    for entry in entry_list {
+        let filepath = entry.path();
+        let name = entry.name();
+        if name.len() <= 1 || name.starts_with('.') {
             continue;
         }
 
-        let mut target = format!("./{}", filepath.split('/').last().unwrap_or_default());
-        if !is_file {
-            target += "/";
+        let meta = entry.metadata();
+        let mut size = "".to_string();
+        let mut last_modified = "".to_string();
+        if meta.is_file() {
+            size = ByteSize(meta.content_length()).to_string();
+            if let Some(value) = meta.last_modified() {
+                last_modified = value.timestamp().to_string();
+            }
         }
+
+        let target = format!("./{filepath}");
+
         file_list_html.push(format!(
             r###"<tr>
                 <td class="name"><a href="{target}">{name}</a></td>
@@ -133,7 +138,6 @@ fn get_autoindex_html(path: &Path) -> Result<String> {
 
 #[derive(Debug, Clone, Default)]
 pub struct StaticServeParams {
-    pub dir: String,
     pub file: String,
     pub index: String,
     pub autoindex: bool,
@@ -150,7 +154,6 @@ struct FileInfoCache {
 #[derive(Clone)]
 struct FileInfo {
     headers: Vec<(HeaderName, String)>,
-    path: PathBuf,
     body: Option<Vec<u8>>,
 }
 
@@ -204,22 +207,17 @@ fn set_file_to_cache(file: &str, info: &FileInfo) {
 }
 
 async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
-    let file = &params.file;
-    if let Some(info) = get_file_from_cache(file) {
+    let mut file = params.file.clone();
+    if let Some(info) = get_file_from_cache(&file) {
         return Ok(info);
     }
-    let dir = PathBuf::from(&params.dir);
-    let mut path = dir.join(file);
-    if path.to_string_lossy().len() < params.dir.len() {
-        return Err(Error::Unknown {
-            message: "access parent directory is not allowed".to_string(),
-        });
-    }
 
-    let mut meta = fs::metadata(&path).await.map_err(|e| Error::Io {
-        source: e,
-        file: file.clone(),
-    })?;
+    let mut meta = get_storage()?
+        .dal
+        .stat(&file)
+        .await
+        .map_err(|e| Error::Openedal { source: e })?;
+
     let is_dir = meta.is_dir();
     if is_dir && !params.autoindex && params.index.is_empty() {
         return Err(Error::NotFound { file: file.clone() });
@@ -227,23 +225,27 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     let mut headers = vec![];
 
     if is_dir && params.autoindex {
-        let html = get_autoindex_html(path.as_path())?;
+        let html = get_autoindex_html(&file).await?;
         headers.push((header::CONTENT_TYPE, "text/html".to_string()));
         headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
         return Ok(FileInfo {
             headers,
-            path,
             body: Some(html.into_bytes()),
         });
     }
     if is_dir && !params.index.is_empty() {
-        path = path.join(&params.index);
-        meta = fs::metadata(&path).await.map_err(|e| Error::Io {
-            source: e,
-            file: file.clone(),
-        })?;
+        file = if file.ends_with("/") {
+            format!("{file}{}", params.index)
+        } else {
+            format!("{file}/{}", params.index)
+        };
+        meta = get_storage()?
+            .dal
+            .stat(&file)
+            .await
+            .map_err(|e| Error::Openedal { source: e })?;
     }
-    let content_type = mime_guess::from_path(&path)
+    let content_type = mime_guess::from_path(Path::new(&file))
         .first_or_octet_stream()
         .to_string();
     let mut is_html = false;
@@ -256,24 +258,27 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
 
     headers.push((header::CONTENT_TYPE, content_type));
 
-    let size = meta.size();
+    let size = meta.content_length();
     // Generate ETag based on file size and modification time
-    if let Ok(mod_time) = meta.modified() {
-        let value = mod_time
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    if let Some(etag) = meta.etag() {
+        headers.push((header::ETAG, etag.to_string()));
+    } else if let Some(last_modified) = meta.last_modified() {
+        let value = last_modified.timestamp();
         if value > 0 {
             let etag = format!(r#"W/"{:x}-{:x}""#, size, value);
             headers.push((header::ETAG, etag));
         }
     }
+
     // read html or small file
     let body = if is_html || size < 30 * 1024 {
-        let mut buf = fs::read(&path).await.map_err(|e| Error::Io {
-            source: e,
-            file: params.file.clone(),
-        })?;
+        let mut buf = get_storage()?
+            .dal
+            .read(&file)
+            .await
+            .map_err(|e| Error::Openedal { source: e })?
+            .to_vec();
+
         for (key, value) in params.html_replaces.iter() {
             buf = buf.replace(key, value);
         }
@@ -281,13 +286,9 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     } else {
         None
     };
-    let info = FileInfo {
-        headers,
-        path,
-        body,
-    };
+    let info = FileInfo { headers, body };
     if !is_html && info.body.is_some() {
-        set_file_to_cache(file, &info);
+        set_file_to_cache(&file, &info);
     }
 
     Ok(info)
@@ -297,19 +298,11 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
 pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
     let file_info = get_file(&params).await?;
 
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .open(file_info.path)
-        .await
-        .map_err(|e| Error::Io {
-            source: e,
-            file: params.file.clone(),
-        })?;
-
     let mut resp = if let Some(body) = file_info.body {
         body.into_response()
     } else {
-        let stream = ReaderStream::new(file);
+        let r = get_storage()?.dal.reader(&params.file).await.unwrap();
+        let stream = ReaderStream::new(r.into_futures_async_read(0..).await.unwrap().compat());
         let body = Body::from_stream(stream);
         body.into_response()
     };

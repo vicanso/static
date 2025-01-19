@@ -21,27 +21,22 @@ use tracing::error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("IO error: {file}, {source}"))]
-    Io {
-        file: String,
-        source: std::io::Error,
-    },
     #[snafu(display("Unknown error: {message}"))]
     Unknown {
         message: String,
-    },
-    #[snafu(display("Pattern error: {source}"))]
-    Pattern {
-        source: glob::PatternError,
-    },
-    #[snafu(display("Glob error: {source}"))]
-    Glob {
-        source: glob::GlobError,
     },
     Timeout,
     #[snafu(display("File not found: {file}"))]
     NotFound {
         file: String,
+    },
+    #[snafu(display("Openedal error: {source}"))]
+    Openedal {
+        source: opendal::Error,
+    },
+    #[snafu(display("Parse url error: {source}"))]
+    ParseUrl {
+        source: url::ParseError,
     },
 }
 
