@@ -48,6 +48,13 @@ impl IntoResponse for Error {
             Error::Unknown { message } => (StatusCode::INTERNAL_SERVER_ERROR, message),
             Error::NotFound { file } => (StatusCode::NOT_FOUND, format!("{file} not found")),
             Error::Timeout => (StatusCode::REQUEST_TIMEOUT, "request timeout".to_string()),
+            Error::Openedal { source } => {
+                if source.kind() == opendal::ErrorKind::NotFound {
+                    (StatusCode::NOT_FOUND, format!("{source}"))
+                } else {
+                    (StatusCode::BAD_REQUEST, format!("{source}"))
+                }
+            }
             _ => (StatusCode::BAD_REQUEST, self.to_string()),
         };
         let mut res = message.into_response();

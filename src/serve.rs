@@ -222,7 +222,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     if is_dir && !params.autoindex && params.index.is_empty() {
         return Err(Error::NotFound { file: file.clone() });
     }
-    let mut headers = vec![];
+    let mut headers = Vec::with_capacity(4);
 
     if is_dir && params.autoindex {
         let html = get_autoindex_html(&file).await?;
@@ -245,18 +245,27 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             .await
             .map_err(|e| Error::Openedal { source: e })?;
     }
-    let content_type = mime_guess::from_path(Path::new(&file))
-        .first_or_octet_stream()
-        .to_string();
+    let content_type = meta
+        .content_type()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| {
+            mime_guess::from_path(Path::new(&file))
+                .first_or_octet_stream()
+                .to_string()
+        });
     let mut is_html = false;
     if content_type.contains("text/html") {
         is_html = true;
         headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
+    } else if let Some(cache_control) = meta.cache_control() {
+        headers.push((header::CACHE_CONTROL, cache_control.to_string()));
     } else {
         headers.push((header::CACHE_CONTROL, params.cache_control.clone()));
     }
-
     headers.push((header::CONTENT_TYPE, content_type));
+    if let Some(content_encoding) = meta.content_encoding() {
+        headers.push((header::CONTENT_ENCODING, content_encoding.to_string()));
+    }
 
     let size = meta.content_length();
     // Generate ETag based on file size and modification time
