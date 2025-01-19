@@ -178,7 +178,7 @@ fn get_file_from_cache(file: &String) -> Option<FileInfo> {
         if info.expired_at
             > SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs()
         {
             return Some(info.data.clone());
@@ -193,7 +193,7 @@ fn set_file_to_cache(file: &str, info: &FileInfo) {
     }
     let expired_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
         + STATIC_CACHE_TTL.as_secs();
     STATIC_CACHE.put(
@@ -310,8 +310,17 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
     let mut resp = if let Some(body) = file_info.body {
         body.into_response()
     } else {
-        let r = get_storage()?.dal.reader(&params.file).await.unwrap();
-        let stream = ReaderStream::new(r.into_futures_async_read(0..).await.unwrap().compat());
+        let r = get_storage()?
+            .dal
+            .reader(&params.file)
+            .await
+            .map_err(|e| Error::Openedal { source: e })?;
+        let stream = ReaderStream::new(
+            r.into_futures_async_read(0..)
+                .await
+                .map_err(|e| Error::Openedal { source: e })?
+                .compat(),
+        );
         let body = Body::from_stream(stream);
         body.into_response()
     };

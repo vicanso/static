@@ -14,6 +14,7 @@
 
 use crate::error::Error;
 use once_cell::sync::OnceCell;
+use opendal::layers::MimeGuessLayer;
 use url::Url;
 
 pub struct Storage {
@@ -68,6 +69,7 @@ fn new_s3_dal(url: &str) -> Result<Storage, Error> {
 
     let dal = opendal::Operator::new(builder)
         .map_err(|e| Error::Openedal { source: e })?
+        .layer(MimeGuessLayer::default())
         .finish();
     Ok(Storage { dal })
 }
@@ -82,6 +84,7 @@ pub fn get_storage() -> Result<&'static Storage, Error> {
                 let opendal = opendal::services::Fs::default().root(static_path.as_str());
                 let dal = opendal::Operator::new(opendal)
                     .map_err(|e| Error::Openedal { source: e })?
+                    .layer(MimeGuessLayer::default())
                     .finish();
                 Ok(Storage { dal })
             }
