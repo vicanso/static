@@ -27,6 +27,8 @@ pub struct Storage {
 static STORAGE: OnceCell<Storage> = OnceCell::new();
 
 struct StorageParams {
+    user: String,
+    password: Option<String>,
     endpoint: String,
     path: String,
     query: HashMap<String, String>,
@@ -42,12 +44,15 @@ fn parse_params(url: &str) -> Result<StorageParams> {
     if let Some(port) = info.port() {
         endpoint = format!("{}:{}", endpoint, port);
     }
+
     let mut query = HashMap::new();
     info.query_pairs().for_each(|(k, v)| {
         query.insert(k.to_string(), v.to_string());
     });
 
     Ok(StorageParams {
+        user: info.username().to_string(),
+        password: info.password().map(|v| v.to_string()),
         endpoint,
         path: info.path().to_string(),
         query,
@@ -86,12 +91,21 @@ fn new_ftp_dal(url: &str) -> Result<Storage> {
     if !params.path.is_empty() {
         builder = builder.root(&params.path);
     }
-    if let Some(user) = params.query.get("user") {
-        builder = builder.user(user);
+    if !params.user.is_empty() {
+        builder = builder.user(&params.user);
     }
-    if let Some(password) = params.query.get("password") {
-        builder = builder.password(password);
+    if let Some(password) = params.password {
+        builder = builder.password(&password);
     }
+    let dal = opendal::Operator::new(builder)
+        .map_err(|e| Error::Openedal { source: e })?
+        .layer(MimeGuessLayer::default())
+        .finish();
+    Ok(Storage { dal })
+}
+
+fn new_gridfs_dal(url: &str) -> Result<Storage> {
+    let builder = opendal::services::Gridfs::default().connection_string(url);
     let dal = opendal::Operator::new(builder)
         .map_err(|e| Error::Openedal { source: e })?
         .layer(MimeGuessLayer::default())
@@ -106,6 +120,7 @@ pub fn get_storage() -> Result<&'static Storage> {
         match static_service.as_str() {
             "s3" => new_s3_dal(&static_path),
             "ftp" => new_ftp_dal(&static_path),
+            "gridfs" => new_gridfs_dal(&static_path),
             _ => {
                 let opendal = opendal::services::Fs::default().root(static_path.as_str());
                 let dal = opendal::Operator::new(opendal)

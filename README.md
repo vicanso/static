@@ -10,3 +10,11 @@
 - `STATIC_CACHE_CONTROL`: cache control, default is `public, max-age=31536000, immutable`, and html will be `no-cache`
 - `STATIC_CACHE_SIZE`: cache size, default is `1024`
 - `STATIC_CACHE_TTL`: cache ttl, default is `10m`, html files will not be cached
+
+
+## Service
+
+- `s3`: `STATIC_PATH="https://s3.amazonaws.com?bucket=static&region=us-east-1&access_key_id=***&secret_access_key=***"`
+- `ftp`: `STATIC_PATH="ftp://user:password@ftp.example.com"`
+- `gridfs`: `STATIC_PATH="mongodb://user:password@mongodb1.example.com:27317,mongodb2.example.com:27017/?connectTimeoutMS=300000&replicaSet=mySet"`
+- `fs`: `STATIC_PATH="/static"`
