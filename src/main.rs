@@ -49,7 +49,7 @@ static STATIC_AUTOINDEX: LazyLock<bool> = LazyLock::new(|| {
 });
 
 static STATIC_LISTEN_ADDR: LazyLock<String> =
-    LazyLock::new(|| std::env::var("STATIC_LISTEN_ADDR").unwrap_or("127.0.0.1:3000".to_string()));
+    LazyLock::new(|| std::env::var("STATIC_LISTEN_ADDR").unwrap_or("0.0.0.0:3000".to_string()));
 
 static STATIC_CACHE_CONTROL: LazyLock<String> = LazyLock::new(|| {
     std::env::var("STATIC_CACHE_CONTROL")

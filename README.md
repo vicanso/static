@@ -18,3 +18,13 @@
 - `ftp`: `STATIC_PATH="ftp://user:password@ftp.example.com"`
 - `gridfs`: `STATIC_PATH="mongodb://user:password@mongodb1.example.com:27317,mongodb2.example.com:27017/?connectTimeoutMS=300000&replicaSet=mySet"`
 - `fs`: `STATIC_PATH="/static"`
+
+
+## Usage
+
+```bash
+docker run -d --restart=always \
+    -p 3000:3000 \
+    --name static \
+    -v ./static:/static:ro vicanso/static 
+```
