@@ -21,6 +21,7 @@ use serve::{static_serve, StaticServeParams};
 use std::sync::LazyLock;
 use std::time::Duration;
 use substring::Substring;
+use tokio::signal;
 use tower::ServiceBuilder;
 use tower_http::compression::predicate::SizeAbove;
 use tower_http::compression::CompressionLayer;
@@ -68,6 +69,32 @@ static STATIC_HTML_REPLACES: LazyLock<Vec<(Vec<u8>, Vec<u8>)>> = LazyLock::new(|
     values
 });
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        // TODO 后续有需要可在此设置ping的状态
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("signal received, starting graceful shutdown");
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -94,7 +121,10 @@ async fn main() {
         .unwrap();
     info!("Server running on http://{}", STATIC_LISTEN_ADDR.as_str());
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
 }
 
 // 处理函数

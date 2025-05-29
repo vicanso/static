@@ -11,16 +11,16 @@ bytesize = "2.0.1"
 humantime = "2.2.0"
 mime_guess = "2.0.5"
 once_cell = "1.21.3"
-opendal = { version = "0.53.2", features = [
+opendal = { version = "0.53.3", features = [
     "services-fs",
     "services-ftp",
     "services-gridfs",
     "services-s3",
     "layers-mime-guess",
 ] }
-snafu = "0.8.5"
+snafu = "0.8.6"
 substring = "1.4.5"
-tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.15", features = ["compat"] }
 tower = { version = "0.5.2", features = ["timeout"] }
 tower-http = { version = "0.6.4", features = [
@@ -35,5 +35,7 @@ urlencoding = "2.1.3"
 
 [profile.release]
 codegen-units = 1
+opt-level = "z"
 lto = true
-strip = "debuginfo"
+strip = true
+panic = "abort"
