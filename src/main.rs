@@ -13,14 +13,16 @@
 // limitations under the License.
 
 use crate::error::{handle_error, Result};
+use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
-use axum::http::Uri;
+use axum::http::{Request, Uri};
+use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::get;
-use axum::Router;
+use axum::{middleware::Next, Router};
 use serve::{static_serve, StaticServeParams};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use substring::Substring;
 use tokio::signal;
 use tower::ServiceBuilder;
@@ -105,7 +107,9 @@ async fn main() {
         .fallback(get(serve));
 
     let builder = ServiceBuilder::new();
-    let builder = builder.layer(HandleErrorLayer::new(handle_error));
+    let builder = builder
+        .layer(from_fn(access_log))
+        .layer(HandleErrorLayer::new(handle_error));
     let size = *STATIC_COMPRESS_MIN_LENGTH;
     let app = if size > 0 {
         let predicate = SizeAbove::new(size)
@@ -130,6 +134,27 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+}
+
+async fn access_log(req: Request<Body>, next: Next) -> Response {
+    let user_agent = if let Some(user_agent) = req.headers().get("User-Agent") {
+        user_agent.to_str().unwrap_or_default()
+    } else {
+        ""
+    };
+
+    let message = format!(r#"{} {} "{}""#, req.method(), req.uri(), user_agent);
+    let start = Instant::now();
+
+    let response = next.run(req).await;
+    let duration = start.elapsed();
+    info!(
+        "{} {} {}ms",
+        message,
+        response.status().as_u16(),
+        duration.as_millis()
+    );
+    response
 }
 
 // 处理函数
