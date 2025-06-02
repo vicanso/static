@@ -16,14 +16,15 @@ use crate::error::{handle_error, Result};
 use axum::error_handling::HandleErrorLayer;
 use axum::http::Uri;
 use axum::response::Response;
-use axum::{routing::get, Router};
+use axum::routing::get;
+use axum::Router;
 use serve::{static_serve, StaticServeParams};
 use std::sync::LazyLock;
 use std::time::Duration;
 use substring::Substring;
 use tokio::signal;
 use tower::ServiceBuilder;
-use tower_http::compression::predicate::SizeAbove;
+use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
 use tracing::info;
 
@@ -107,9 +108,13 @@ async fn main() {
     let builder = builder.layer(HandleErrorLayer::new(handle_error));
     let size = *STATIC_COMPRESS_MIN_LENGTH;
     let app = if size > 0 {
+        let predicate = SizeAbove::new(size)
+            .and(NotForContentType::GRPC)
+            .and(NotForContentType::IMAGES)
+            .and(NotForContentType::SSE);
         app.layer(
             builder
-                .layer(CompressionLayer::new().compress_when(SizeAbove::new(size)))
+                .layer(CompressionLayer::new().compress_when(predicate))
                 .timeout(*STATIC_TIMEOUT),
         )
     } else {
