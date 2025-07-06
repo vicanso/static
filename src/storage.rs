@@ -42,7 +42,7 @@ fn parse_params(url: &str) -> Result<StorageParams> {
         info.host().map(|v| v.to_string()).unwrap_or_default()
     );
     if let Some(port) = info.port() {
-        endpoint = format!("{}:{}", endpoint, port);
+        endpoint = format!("{endpoint}:{port}");
     }
 
     let mut query = HashMap::new();

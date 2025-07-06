@@ -274,7 +274,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     } else if let Some(last_modified) = meta.last_modified() {
         let value = last_modified.timestamp();
         if value > 0 {
-            let etag = format!(r#"W/"{:x}-{:x}""#, size, value);
+            let etag = format!(r#"W/"{size:x}-{value:x}""#);
             headers.push((header::ETAG, etag));
         }
     }

@@ -1,4 +1,4 @@
-FROM rust:1.84.0 as builder
+FROM rust:1.88.0 as builder
 
 COPY . /static
 

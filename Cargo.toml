@@ -1,7 +1,7 @@
 [package]
 name = "static-serve"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 TinyUFO = "0.5.0"
@@ -20,10 +20,10 @@ opendal = { version = "0.53.3", features = [
 ] }
 snafu = "0.8.6"
 substring = "1.4.5"
-tokio = { version = "1.45.1", features = ["rt-multi-thread", "signal"] }
+tokio = { version = "1.46.1", features = ["rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.15", features = ["compat"] }
 tower = { version = "0.5.2", features = ["timeout"] }
-tower-http = { version = "0.6.4", features = [
+tower-http = { version = "0.6.6", features = [
     "compression-br",
     "compression-gzip",
     "compression-zstd",

@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{handle_error, Result};
+use crate::error::{handle_error, Error, Result};
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
+use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::http::request::Parts;
 use axum::http::{Request, Uri};
 use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::get;
 use axum::{middleware::Next, Router};
 use serve::{static_serve, StaticServeParams};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use substring::Substring;
@@ -81,7 +84,7 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        // TODO 后续有需要可在此设置ping的状态
+        // TODO 后续有需要可在此设置health的状态
         signal::unix::signal(signal::unix::SignalKind::terminate())
             .expect("failed to install signal handler")
             .recv()
@@ -130,20 +133,64 @@ async fn main() {
         .unwrap();
     info!("Server running on http://{}", STATIC_LISTEN_ADDR.as_str());
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap();
 }
 
-async fn access_log(req: Request<Body>, next: Next) -> Response {
+#[derive(Debug, Clone, Copy)]
+pub struct ClientIp(pub IpAddr);
+
+impl<S> FromRequestParts<S> for ClientIp
+where
+    S: Sync,
+{
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        if let Some(x_forwarded_for) = parts.headers.get("X-Forwarded-For") {
+            if let Some(ip) = x_forwarded_for
+                .to_str()
+                .unwrap_or_default()
+                .split(',')
+                .next()
+            {
+                if let Ok(ip) = ip.parse::<IpAddr>() {
+                    return Ok(ClientIp(ip));
+                }
+            }
+        }
+        if let Some(x_real_ip) = parts.headers.get("X-Real-Ip") {
+            if let Ok(ip) = x_real_ip.to_str().unwrap().parse::<IpAddr>() {
+                return Ok(ClientIp(ip));
+            }
+        }
+        let ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip())
+            .ok_or_else(|| Error::Unknown {
+                message: "no connect info".to_string(),
+            })?;
+        Ok(ClientIp(ip))
+    }
+}
+
+async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> Response {
     let user_agent = if let Some(user_agent) = req.headers().get("User-Agent") {
         user_agent.to_str().unwrap_or_default()
     } else {
         ""
     };
 
-    let message = format!(r#"{} {} "{}""#, req.method(), req.uri(), user_agent);
+    let message = format!(r#"{ip} - {} {} "{}""#, req.method(), req.uri(), user_agent);
     let start = Instant::now();
 
     let response = next.run(req).await;
