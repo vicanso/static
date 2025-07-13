@@ -10,6 +10,7 @@
 - `STATIC_CACHE_CONTROL`: cache control, default is `public, max-age=31536000, immutable`, and html will be `no-cache`
 - `STATIC_CACHE_SIZE`: cache size, default is `1024`
 - `STATIC_CACHE_TTL`: cache ttl, default is `10m`, html files will not be cached
+- `STATIC_HTML_REPLACE_*`: replace html content, `STATIC_HTML_REPLACE_{{HOST}}=https://test.com` means replace `{{HOST}}` to `https://test.com`
 
 
 ## Service

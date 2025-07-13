@@ -15,16 +15,20 @@
 use crate::error::{Error, Result};
 use crate::storage::get_storage;
 use axum::body::Body;
-use axum::http::{header, HeaderName, HeaderValue};
+use axum::http::{HeaderName, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use bstr::ByteSlice;
 use bytesize::ByteSize;
+use once_cell::sync::Lazy;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
+
+pub static X_ORIGINAL_SIZE_HEADER_NAME: Lazy<HeaderName> =
+    Lazy::new(|| HeaderName::from_bytes(b"X-Original-Size").unwrap());
 
 // Static HTML template for directory listing view
 // Includes basic styling and JavaScript for date formatting
@@ -277,6 +281,9 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             let etag = format!(r#"W/"{size:x}-{value:x}""#);
             headers.push((header::ETAG, etag));
         }
+    }
+    if size > 0 {
+        headers.push((X_ORIGINAL_SIZE_HEADER_NAME.clone(), size.to_string()));
     }
 
     // read html or small file

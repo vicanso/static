@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{handle_error, Error, Result};
+use crate::error::{Error, Result, handle_error};
+use crate::serve::X_ORIGINAL_SIZE_HEADER_NAME;
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::{ConnectInfo, FromRequestParts};
@@ -21,16 +22,16 @@ use axum::http::{Request, Uri};
 use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::get;
-use axum::{middleware::Next, Router};
-use serve::{static_serve, StaticServeParams};
+use axum::{Router, middleware::Next};
+use serve::{StaticServeParams, static_serve};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use substring::Substring;
 use tokio::signal;
 use tower::ServiceBuilder;
-use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tracing::info;
 
 mod error;
@@ -185,21 +186,29 @@ where
 
 async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> Response {
     let user_agent = if let Some(user_agent) = req.headers().get("User-Agent") {
-        user_agent.to_str().unwrap_or_default()
+        if let Ok(user_agent) = user_agent.to_str() {
+            user_agent.to_string()
+        } else {
+            "".to_string()
+        }
     } else {
-        ""
+        "".to_string()
     };
 
-    let message = format!(r#"{ip} - {} {} "{}""#, req.method(), req.uri(), user_agent);
+    let message = format!(r#"{ip} - "{} {}""#, req.method(), req.uri());
     let start = Instant::now();
 
     let response = next.run(req).await;
-    let duration = start.elapsed();
+    let mut size = "-".to_string();
+    if let Some(value) = response.headers().get(X_ORIGINAL_SIZE_HEADER_NAME.as_str()) {
+        if let Ok(value) = value.to_str() {
+            size = value.to_string();
+        }
+    };
+    let duration = start.elapsed().as_millis();
     info!(
-        "{} {} {}ms",
-        message,
+        r#"{message} {} {size} {duration}ms "{user_agent}""#,
         response.status().as_u16(),
-        duration.as_millis()
     );
     response
 }
