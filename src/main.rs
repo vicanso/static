@@ -64,6 +64,18 @@ static STATIC_CACHE_CONTROL: LazyLock<String> = LazyLock::new(|| {
         .unwrap_or("public, max-age=31536000, immutable".to_string())
 });
 
+static STATIC_FALLBACK_INDEX_404: LazyLock<bool> = LazyLock::new(|| {
+    let fallback_index_404 =
+        std::env::var("STATIC_FALLBACK_INDEX_404").unwrap_or("false".to_string());
+    fallback_index_404.parse::<bool>().unwrap_or(false)
+});
+
+static STATIC_FALLBACK_HTML_404: LazyLock<bool> = LazyLock::new(|| {
+    let fallback_html_404 =
+        std::env::var("STATIC_FALLBACK_HTML_404").unwrap_or("false".to_string());
+    fallback_html_404.parse::<bool>().unwrap_or(false)
+});
+
 static STATIC_HTML_REPLACES: LazyLock<Vec<(Vec<u8>, Vec<u8>)>> = LazyLock::new(|| {
     let prefix = "STATIC_HTML_REPLACE_";
     let mut values = vec![];
@@ -213,6 +225,12 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
     response
 }
 
+enum HandleCategory {
+    Normal,
+    ExtHtml,
+    IndexHtml,
+}
+
 // 处理函数
 async fn serve(uri: Uri) -> Result<Response> {
     let path = uri.path();
@@ -226,14 +244,40 @@ async fn serve(uri: Uri) -> Result<Response> {
     } else {
         file
     };
-    static_serve(StaticServeParams {
-        index: STATIC_INDEX_FILE.clone(),
-        autoindex: *STATIC_AUTOINDEX,
-        cache_control: STATIC_CACHE_CONTROL.clone(),
-        html_replaces: STATIC_HTML_REPLACES.clone(),
-        file,
-    })
-    .await
+
+    let mut category_list = vec![HandleCategory::Normal];
+    if *STATIC_FALLBACK_HTML_404 {
+        category_list.push(HandleCategory::ExtHtml);
+    }
+    if *STATIC_FALLBACK_INDEX_404 {
+        category_list.push(HandleCategory::IndexHtml);
+    }
+    let mut err = Error::NotFound { file: file.clone() };
+
+    for category in category_list {
+        let current_file = match category {
+            HandleCategory::Normal => file.clone(),
+            HandleCategory::ExtHtml => format!("{}.html", file),
+            HandleCategory::IndexHtml => STATIC_INDEX_FILE.clone(),
+        };
+        err = match static_serve(StaticServeParams {
+            index: STATIC_INDEX_FILE.clone(),
+            autoindex: *STATIC_AUTOINDEX,
+            cache_control: STATIC_CACHE_CONTROL.clone(),
+            html_replaces: STATIC_HTML_REPLACES.clone(),
+            file: current_file,
+        })
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(e) => e,
+        };
+        if err.is_not_found() {
+            continue;
+        }
+        return Err(err);
+    }
+    return Err(err);
 }
 
 async fn health_check() -> &'static str {

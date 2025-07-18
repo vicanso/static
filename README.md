@@ -11,6 +11,8 @@
 - `STATIC_CACHE_SIZE`: cache size, default is `1024`
 - `STATIC_CACHE_TTL`: cache ttl, default is `10m`, html files will not be cached
 - `STATIC_HTML_REPLACE_*`: replace html content, `STATIC_HTML_REPLACE_{{HOST}}=https://test.com` means replace `{{HOST}}` to `https://test.com`
+- `STATIC_FALLBACK_INDEX_404`: use index html for 404 not found route
+- `STATIC_FALLBACK_HTML_404`: use `.html` for 404 not found route
 
 
 ## Service

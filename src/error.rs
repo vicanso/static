@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use axum::http::HeaderValue;
-use axum::http::{header, Method, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
 use axum::BoxError;
+use axum::http::HeaderValue;
+use axum::http::{Method, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
 use snafu::Snafu;
 use tracing::error;
 
@@ -38,6 +38,16 @@ pub enum Error {
     ParseUrl {
         source: url::ParseError,
     },
+}
+
+impl Error {
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Error::NotFound { .. } => true,
+            Error::Openedal { source } => source.kind() == opendal::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
