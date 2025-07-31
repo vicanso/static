@@ -18,6 +18,7 @@ use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::http::{Request, Uri};
 use axum::middleware::from_fn;
 use axum::response::Response;
@@ -86,6 +87,24 @@ static STATIC_HTML_REPLACES: LazyLock<Vec<(Vec<u8>, Vec<u8>)>> = LazyLock::new(|
         }
     }
     values
+});
+
+static STATIC_RESPONSE_HEADERS: LazyLock<HeaderMap> = LazyLock::new(|| {
+    let prefix = "STATIC_RESPONSE_HEADER_";
+    let mut headers = HeaderMap::new();
+    for (key, value) in std::env::vars() {
+        if key.starts_with(prefix) {
+            let key = key.substring(prefix.len(), key.len()).replace("_", "-");
+            let Ok(key) = HeaderName::try_from(key) else {
+                continue;
+            };
+            let Ok(value) = HeaderValue::try_from(value) else {
+                continue;
+            };
+            headers.insert(key, value);
+        }
+    }
+    headers
 });
 
 async fn shutdown_signal() {
@@ -269,7 +288,12 @@ async fn serve(uri: Uri) -> Result<Response> {
         })
         .await
         {
-            Ok(response) => return Ok(response),
+            Ok(mut response) => {
+                for (key, value) in STATIC_RESPONSE_HEADERS.iter() {
+                    response.headers_mut().insert(key, value.clone());
+                }
+                return Ok(response);
+            }
             Err(e) => e,
         };
         if err.is_not_found() {
