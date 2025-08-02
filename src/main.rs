@@ -26,6 +26,7 @@ use axum::routing::get;
 use axum::{Router, middleware::Next};
 use serve::{StaticServeParams, static_serve};
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -34,7 +35,8 @@ use tokio::signal;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
-use tracing::info;
+use tracing::{Level, info};
+use tracing_subscriber::FmtSubscriber;
 
 mod error;
 mod serve;
@@ -139,10 +141,7 @@ async fn shutdown_signal() {
     info!("signal received, starting graceful shutdown");
 }
 
-#[tokio::main(worker_threads = 2)]
-async fn main() {
-    tracing_subscriber::fmt::init();
-
+async fn run() {
     let app = Router::new()
         .route("/health", get(health_check))
         .fallback(get(serve));
@@ -316,4 +315,39 @@ async fn health_check() -> (StatusCode, &'static str) {
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, "unhealthy")
     }
+}
+
+fn init_logger() {
+    let mut level = Level::INFO;
+    if let Ok(log_level) = std::env::var("LOG_LEVEL") {
+        if let Ok(value) = Level::from_str(log_level.as_str()) {
+            level = value;
+        }
+    }
+    let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339().unwrap_or_else(|_| {
+        tracing_subscriber::fmt::time::OffsetTime::new(
+            time::UtcOffset::from_hms(0, 0, 0).unwrap(),
+            time::format_description::well_known::Rfc3339,
+        )
+    });
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(level)
+        .with_timer(timer)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+}
+
+fn main() {
+    init_logger();
+    let cpus = std::env::var("STATIC_THREADS")
+        .map(|v| v.parse::<usize>().unwrap_or(num_cpus::get()))
+        .unwrap_or(num_cpus::get())
+        .max(1);
+    info!(threads = cpus, "start static server");
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(cpus)
+        .build()
+        .unwrap()
+        .block_on(run());
 }
