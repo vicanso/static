@@ -81,7 +81,11 @@ pub async fn handle_error(
     // the last argument must be the error itself
     err: BoxError,
 ) -> Error {
-    error!("method:{}, uri:{}, error:{}", method, uri, err.to_string());
+    error!(
+        method = %method,
+        uri = %uri,
+        error = %err
+    );
     if err.is::<tower::timeout::error::Elapsed>() {
         return Error::Timeout;
     }

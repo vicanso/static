@@ -18,7 +18,7 @@ use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::http::{Request, Uri};
 use axum::middleware::from_fn;
 use axum::response::Response;
@@ -27,6 +27,7 @@ use axum::{Router, middleware::Next};
 use serve::{StaticServeParams, static_serve};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use substring::Substring;
 use tokio::signal;
@@ -38,6 +39,8 @@ use tracing::info;
 mod error;
 mod serve;
 mod storage;
+
+static HEALTH_CHECK_RUNNING: AtomicBool = AtomicBool::new(true);
 
 static STATIC_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     let timeout = std::env::var("STATIC_TIMEOUT").unwrap_or("30s".to_string());
@@ -116,11 +119,14 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        // TODO 后续有需要可在此设置health的状态
         signal::unix::signal(signal::unix::SignalKind::terminate())
             .expect("failed to install signal handler")
             .recv()
             .await;
+        info!("SIGTERM received, health check will return 500");
+        HEALTH_CHECK_RUNNING.store(false, Ordering::Relaxed);
+        // 等待5秒
+        tokio::time::sleep(Duration::from_secs(5)).await;
     };
 
     #[cfg(not(unix))]
@@ -133,7 +139,7 @@ async fn shutdown_signal() {
     info!("signal received, starting graceful shutdown");
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() {
     tracing_subscriber::fmt::init();
 
@@ -276,7 +282,7 @@ async fn serve(uri: Uri) -> Result<Response> {
     for category in category_list {
         let current_file = match category {
             HandleCategory::Normal => file.clone(),
-            HandleCategory::ExtHtml => format!("{}.html", file),
+            HandleCategory::ExtHtml => format!("{file}.html"),
             HandleCategory::IndexHtml => STATIC_INDEX_FILE.clone(),
         };
         err = match static_serve(StaticServeParams {
@@ -301,9 +307,13 @@ async fn serve(uri: Uri) -> Result<Response> {
         }
         return Err(err);
     }
-    return Err(err);
+    Err(err)
 }
 
-async fn health_check() -> &'static str {
-    "OK"
+async fn health_check() -> (StatusCode, &'static str) {
+    if HEALTH_CHECK_RUNNING.load(Ordering::Relaxed) {
+        (StatusCode::OK, "healthy")
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "unhealthy")
+    }
 }
