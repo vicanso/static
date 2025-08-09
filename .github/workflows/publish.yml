@@ -7,18 +7,26 @@ on:
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
   CARGO_TERM_COLOR: always
+  IMAGE_NAME: vicanso/static
 
 jobs:
-  docker:
-    runs-on: ubuntu-24.04
+  build:
     timeout-minutes: 3600
+    runs-on: ${{ matrix.platform.runs-on }}
+    strategy:
+      matrix:
+        platform:
+          - { arch: "linux/amd64", tag: "amd64", runs-on: "ubuntu-24.04" }
+          - { arch: "linux/arm64", tag: "arm64", runs-on: "ubuntu-24.04-arm" }
     steps:
       - name: Change Swap Space
         run: |
           swapon --show=NAME | tail -n 1
           df -lh
-          du -sh /usr/local/lib/android
-          sudo rm -rf /usr/local/lib/android
+          if [ -d /usr/local/lib/android ]; then
+            du -sh /usr/local/lib/android
+            sudo rm -rf /usr/local/lib/android
+          fi
           export SWAP_FILE=$(swapon --show=NAME | tail -n 1)
           sudo swapoff $SWAP_FILE
           sudo rm $SWAP_FILE
@@ -36,18 +44,9 @@ jobs:
           swapon --show
           df -lh
           echo
+          arch
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          images: |
-            vicanso/static
-          tags: |
-            type=raw,value=latest
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
@@ -60,11 +59,32 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
       - name: Build and push
         id: docker_build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          platforms: linux/amd64, linux/arm64
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform.arch }}
+          build-args: |
+            GIT_COMMIT_ID=${{ github.sha }}
+          tags: ${{ env.IMAGE_NAME }}:${{ matrix.platform.tag }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
       - name: Image digest
         run: |
           echo ${{ steps.docker_build.outputs.digest }}
+  merge:
+    runs-on: ubuntu-24.04
+    needs: [build] # 等待所有架构构建完成
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      - name: Create and push multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            ${{ env.IMAGE_NAME }}:amd64 \
+            ${{ env.IMAGE_NAME }}:arm64
