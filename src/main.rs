@@ -343,7 +343,17 @@ fn main() {
         .map(|v| v.parse::<usize>().unwrap_or(num_cpus::get()))
         .unwrap_or(num_cpus::get())
         .max(1);
-    info!(threads = cpus, "start static server");
+    info!(
+        threads = cpus,
+        timeout = *STATIC_TIMEOUT,
+        compress_min_length = *STATIC_COMPRESS_MIN_LENGTH,
+        index_file = *STATIC_INDEX_FILE,
+        autoindex = *STATIC_AUTOINDEX,
+        listen_addr = *STATIC_LISTEN_ADDR,
+        cache_control = *STATIC_CACHE_CONTROL,
+        fallback_index_404 = *STATIC_FALLBACK_INDEX_404,
+        "start static server"
+    );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(cpus)
