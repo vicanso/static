@@ -343,15 +343,23 @@ fn main() {
         .map(|v| v.parse::<usize>().unwrap_or(num_cpus::get()))
         .unwrap_or(num_cpus::get())
         .max(1);
+    let timeout = format!("{:?}", *STATIC_TIMEOUT);
+    let compress_min_length = STATIC_COMPRESS_MIN_LENGTH.to_string();
+    let index_file = STATIC_INDEX_FILE.to_string();
+    let autoindex = STATIC_AUTOINDEX.to_string();
+    let listen_addr = STATIC_LISTEN_ADDR.to_string();
+    let cache_control = STATIC_CACHE_CONTROL.to_string();
+    let fallback_index_404 = STATIC_FALLBACK_INDEX_404.to_string();
+
     info!(
         threads = cpus,
-        timeout = *STATIC_TIMEOUT,
-        compress_min_length = *STATIC_COMPRESS_MIN_LENGTH,
-        index_file = *STATIC_INDEX_FILE,
-        autoindex = *STATIC_AUTOINDEX,
-        listen_addr = *STATIC_LISTEN_ADDR,
-        cache_control = *STATIC_CACHE_CONTROL,
-        fallback_index_404 = *STATIC_FALLBACK_INDEX_404,
+        timeout,
+        compress_min_length,
+        index_file,
+        autoindex,
+        listen_addr,
+        cache_control,
+        fallback_index_404,
         "start static server"
     );
     tokio::runtime::Builder::new_multi_thread()
