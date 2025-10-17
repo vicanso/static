@@ -16,18 +16,19 @@ use crate::error::{Error, Result, handle_error};
 use crate::serve::X_ORIGINAL_SIZE_HEADER_NAME;
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::http::StatusCode;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::http::{Request, Uri};
 use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Router, middleware::Next};
+use config::Config;
 use serve::{StaticServeParams, static_serve};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use substring::Substring;
@@ -38,79 +39,12 @@ use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
+mod config;
 mod error;
 mod serve;
 mod storage;
 
 static HEALTH_CHECK_RUNNING: AtomicBool = AtomicBool::new(true);
-
-static STATIC_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    let timeout = std::env::var("STATIC_TIMEOUT").unwrap_or("30s".to_string());
-    humantime::parse_duration(&timeout).unwrap_or(Duration::from_secs(30))
-});
-
-static STATIC_COMPRESS_MIN_LENGTH: LazyLock<u16> = LazyLock::new(|| {
-    let min_length = std::env::var("STATIC_COMPRESS_MIN_LENGTH").unwrap_or("256".to_string());
-    min_length.parse::<u16>().unwrap_or(256)
-});
-
-static STATIC_INDEX_FILE: LazyLock<String> =
-    LazyLock::new(|| std::env::var("STATIC_INDEX_FILE").unwrap_or("index.html".to_string()));
-
-static STATIC_AUTOINDEX: LazyLock<bool> = LazyLock::new(|| {
-    let autoindex = std::env::var("STATIC_AUTOINDEX").unwrap_or("false".to_string());
-    autoindex.parse::<bool>().unwrap_or(false)
-});
-
-static STATIC_LISTEN_ADDR: LazyLock<String> =
-    LazyLock::new(|| std::env::var("STATIC_LISTEN_ADDR").unwrap_or("0.0.0.0:3000".to_string()));
-
-static STATIC_CACHE_CONTROL: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("STATIC_CACHE_CONTROL")
-        .unwrap_or("public, max-age=31536000, immutable".to_string())
-});
-
-static STATIC_FALLBACK_INDEX_404: LazyLock<bool> = LazyLock::new(|| {
-    let fallback_index_404 =
-        std::env::var("STATIC_FALLBACK_INDEX_404").unwrap_or("false".to_string());
-    fallback_index_404.parse::<bool>().unwrap_or(false)
-});
-
-static STATIC_FALLBACK_HTML_404: LazyLock<bool> = LazyLock::new(|| {
-    let fallback_html_404 =
-        std::env::var("STATIC_FALLBACK_HTML_404").unwrap_or("false".to_string());
-    fallback_html_404.parse::<bool>().unwrap_or(false)
-});
-
-static STATIC_HTML_REPLACES: LazyLock<Vec<(Vec<u8>, Vec<u8>)>> = LazyLock::new(|| {
-    let prefix = "STATIC_HTML_REPLACE_";
-    let mut values = vec![];
-    for (key, value) in std::env::vars() {
-        if key.starts_with(prefix) {
-            let key = key.substring(prefix.len(), key.len());
-            values.push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
-        }
-    }
-    values
-});
-
-static STATIC_RESPONSE_HEADERS: LazyLock<HeaderMap> = LazyLock::new(|| {
-    let prefix = "STATIC_RESPONSE_HEADER_";
-    let mut headers = HeaderMap::new();
-    for (key, value) in std::env::vars() {
-        if key.starts_with(prefix) {
-            let key = key.substring(prefix.len(), key.len()).replace("_", "-");
-            let Ok(key) = HeaderName::try_from(key) else {
-                continue;
-            };
-            let Ok(value) = HeaderValue::try_from(value) else {
-                continue;
-            };
-            headers.insert(key, value);
-        }
-    }
-    headers
-});
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -141,16 +75,17 @@ async fn shutdown_signal() {
     info!("signal received, starting graceful shutdown");
 }
 
-async fn run() {
+async fn run(config: Arc<Config>) {
     let app = Router::new()
         .route("/health", get(health_check))
-        .fallback(get(serve));
+        .fallback(get(serve))
+        .with_state(config.clone());
 
     let builder = ServiceBuilder::new();
     let builder = builder
         .layer(from_fn(access_log))
         .layer(HandleErrorLayer::new(handle_error));
-    let size = *STATIC_COMPRESS_MIN_LENGTH;
+    let size = config.compress_min_length;
     let app = if size > 0 {
         let predicate = SizeAbove::new(size)
             .and(NotForContentType::GRPC)
@@ -159,16 +94,16 @@ async fn run() {
         app.layer(
             builder
                 .layer(CompressionLayer::new().compress_when(predicate))
-                .timeout(*STATIC_TIMEOUT),
+                .timeout(config.timeout),
         )
     } else {
-        app.layer(builder.timeout(*STATIC_TIMEOUT))
+        app.layer(builder.timeout(config.timeout))
     };
 
-    let listener = tokio::net::TcpListener::bind(STATIC_LISTEN_ADDR.as_str())
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
         .await
         .unwrap();
-    info!("Server running on http://{}", STATIC_LISTEN_ADDR.as_str());
+    info!("server running on http://{}", config.listen_addr);
 
     axum::serve(
         listener,
@@ -192,60 +127,61 @@ where
         parts: &mut Parts,
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
-        if let Some(x_forwarded_for) = parts.headers.get("X-Forwarded-For") {
-            if let Some(ip) = x_forwarded_for
+        if let Some(x_forwarded_for) = parts.headers.get("X-Forwarded-For")
+            && let Some(ip) = x_forwarded_for
                 .to_str()
                 .unwrap_or_default()
                 .split(',')
                 .next()
-            {
-                if let Ok(ip) = ip.parse::<IpAddr>() {
-                    return Ok(ClientIp(ip));
-                }
-            }
+            && let Ok(ip) = ip.parse::<IpAddr>()
+        {
+            return Ok(ClientIp(ip));
         }
-        if let Some(x_real_ip) = parts.headers.get("X-Real-Ip") {
-            if let Ok(ip) = x_real_ip.to_str().unwrap().parse::<IpAddr>() {
-                return Ok(ClientIp(ip));
-            }
+        if let Some(x_real_ip) = parts.headers.get("X-Real-Ip")
+            && let Ok(ip) = x_real_ip.to_str().unwrap().parse::<IpAddr>()
+        {
+            return Ok(ClientIp(ip));
         }
         let ip = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(addr)| addr.ip())
-            .ok_or_else(|| Error::Unknown {
-                message: "no connect info".to_string(),
-            })?;
+            .ok_or_else(|| Error::Unknown)?;
         Ok(ClientIp(ip))
     }
 }
 
 async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> Response {
-    let user_agent = if let Some(user_agent) = req.headers().get("User-Agent") {
-        if let Ok(user_agent) = user_agent.to_str() {
-            user_agent.to_string()
-        } else {
-            "".to_string()
-        }
-    } else {
-        "".to_string()
-    };
+    let method = req.method().clone();
+    let uri = req.uri().clone();
 
-    let message = format!(r#"{ip} - "{} {}""#, req.method(), req.uri());
+    let user_agent = req
+        .headers()
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+
     let start = Instant::now();
-
     let response = next.run(req).await;
-    let mut size = "-".to_string();
-    if let Some(value) = response.headers().get(X_ORIGINAL_SIZE_HEADER_NAME.as_str()) {
-        if let Ok(value) = value.to_str() {
-            size = value.to_string();
-        }
-    };
-    let duration = start.elapsed().as_millis();
+
+    let size = response
+        .headers()
+        .get(X_ORIGINAL_SIZE_HEADER_NAME.as_str())
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+
     info!(
-        r#"{message} {} {size} {duration}ms "{user_agent}""#,
-        response.status().as_u16(),
+        target: "access_log",
+        ip = %ip,
+        method = %method,
+        uri = %uri,
+        status = response.status().as_u16(),
+        size,
+        duration = format!("{}ms", start.elapsed().as_millis()),
+        user_agent,
     );
+
     response
 }
 
@@ -256,7 +192,7 @@ enum HandleCategory {
 }
 
 // 处理函数
-async fn serve(uri: Uri) -> Result<Response> {
+async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> {
     let path = uri.path();
     let file = if !path.is_empty() {
         path.substring(1, path.len()).to_string()
@@ -270,10 +206,10 @@ async fn serve(uri: Uri) -> Result<Response> {
     };
 
     let mut category_list = vec![HandleCategory::Normal];
-    if *STATIC_FALLBACK_HTML_404 {
+    if config.fallback_html_404 {
         category_list.push(HandleCategory::ExtHtml);
     }
-    if *STATIC_FALLBACK_INDEX_404 {
+    if config.fallback_index_404 {
         category_list.push(HandleCategory::IndexHtml);
     }
     let mut err = Error::NotFound { file: file.clone() };
@@ -282,19 +218,21 @@ async fn serve(uri: Uri) -> Result<Response> {
         let current_file = match category {
             HandleCategory::Normal => file.clone(),
             HandleCategory::ExtHtml => format!("{file}.html"),
-            HandleCategory::IndexHtml => STATIC_INDEX_FILE.clone(),
+            HandleCategory::IndexHtml => config.index_file.clone(),
         };
         err = match static_serve(StaticServeParams {
-            index: STATIC_INDEX_FILE.clone(),
-            autoindex: *STATIC_AUTOINDEX,
-            cache_control: STATIC_CACHE_CONTROL.clone(),
-            html_replaces: STATIC_HTML_REPLACES.clone(),
+            index: config.index_file.clone(),
+            autoindex: config.autoindex,
+            cache_control: config.cache_control.clone(),
+            html_replaces: config.html_replaces.clone(),
             file: current_file,
+            cache_size: config.cache_size,
+            cache_ttl: config.cache_ttl,
         })
         .await
         {
             Ok(mut response) => {
-                for (key, value) in STATIC_RESPONSE_HEADERS.iter() {
+                for (key, value) in config.response_headers.iter() {
                     response.headers_mut().insert(key, value.clone());
                 }
                 return Ok(response);
@@ -319,10 +257,10 @@ async fn health_check() -> (StatusCode, &'static str) {
 
 fn init_logger() {
     let mut level = Level::INFO;
-    if let Ok(log_level) = std::env::var("LOG_LEVEL") {
-        if let Ok(value) = Level::from_str(log_level.as_str()) {
-            level = value;
-        }
+    if let Ok(log_level) = std::env::var("LOG_LEVEL")
+        && let Ok(value) = Level::from_str(log_level.as_str())
+    {
+        level = value;
     }
     let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339().unwrap_or_else(|_| {
         tracing_subscriber::fmt::time::OffsetTime::new(
@@ -339,33 +277,20 @@ fn init_logger() {
 
 fn main() {
     init_logger();
+    let config = Arc::new(Config::new());
     let cpus = std::env::var("STATIC_THREADS")
         .map(|v| v.parse::<usize>().unwrap_or(num_cpus::get()))
         .unwrap_or(num_cpus::get())
         .max(1);
-    let timeout = format!("{:?}", *STATIC_TIMEOUT);
-    let compress_min_length = STATIC_COMPRESS_MIN_LENGTH.to_string();
-    let index_file = STATIC_INDEX_FILE.to_string();
-    let autoindex = STATIC_AUTOINDEX.to_string();
-    let listen_addr = STATIC_LISTEN_ADDR.to_string();
-    let cache_control = STATIC_CACHE_CONTROL.to_string();
-    let fallback_index_404 = STATIC_FALLBACK_INDEX_404.to_string();
-
     info!(
         threads = cpus,
-        timeout,
-        compress_min_length,
-        index_file,
-        autoindex,
-        listen_addr,
-        cache_control,
-        fallback_index_404,
-        "start static server"
+        config = ?config,
+        "starting static server",
     );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(cpus)
         .build()
         .unwrap()
-        .block_on(run());
+        .block_on(run(config));
 }

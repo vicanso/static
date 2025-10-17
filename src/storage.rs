@@ -14,14 +14,14 @@
 
 use crate::error::Error;
 use once_cell::sync::OnceCell;
-use opendal::layers::MimeGuessLayer;
+use opendal::{Operator, layers::MimeGuessLayer};
 use std::collections::HashMap;
 use url::Url;
 
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct Storage {
-    pub dal: opendal::Operator,
+    pub dal: Operator,
 }
 
 static STORAGE: OnceCell<Storage> = OnceCell::new();

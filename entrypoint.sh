@@ -1,8 +1,15 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-if [ "${1:0:1}" = '-' ]; then
-    set -- static-serve "$@"
-fi
+# 这个脚本的目的是允许用户灵活地运行命令。
+#
+# 如果用户提供的第一个参数以 '-' 开头 (例如 -p, --port),
+# 我们假设他们想要运行默认的服务器程序 (static-serve) 并传递这些参数。
+#
+# 否则，我们假设用户想要运行一个完全不同的命令 (例如 'bash', 'ls')。
+
+case "$1" in
+    -*) set -- static-serve "$@" ;;
+esac
 
 exec "$@"

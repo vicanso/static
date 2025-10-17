@@ -21,26 +21,20 @@ use tracing::error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unknown error: {message}"))]
-    Unknown {
-        message: String,
-    },
+    #[snafu(display("An internal server error occurred"))]
+    Unknown,
+    #[snafu(display("Request timed out"))]
     Timeout,
     #[snafu(display("File not found: {file}"))]
-    NotFound {
-        file: String,
-    },
+    NotFound { file: String },
     #[snafu(display("Openedal error: {source}"))]
-    Openedal {
-        source: opendal::Error,
-    },
+    Openedal { source: opendal::Error },
     #[snafu(display("Parse url error: {source}"))]
-    ParseUrl {
-        source: url::ParseError,
-    },
+    ParseUrl { source: url::ParseError },
 }
 
 impl Error {
+    /// Checks if the error variant represents a "not found" condition.
     pub fn is_not_found(&self) -> bool {
         match self {
             Error::NotFound { .. } => true,
@@ -54,18 +48,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Error::Unknown { message } => (StatusCode::INTERNAL_SERVER_ERROR, message),
-            Error::NotFound { file } => (StatusCode::NOT_FOUND, format!("{file} not found")),
-            Error::Timeout => (StatusCode::REQUEST_TIMEOUT, "request timeout".to_string()),
-            Error::Openedal { source } => {
-                if source.kind() == opendal::ErrorKind::NotFound {
-                    (StatusCode::NOT_FOUND, format!("{source}"))
-                } else {
-                    (StatusCode::BAD_REQUEST, format!("{source}"))
-                }
+        let (status, message) = if self.is_not_found() {
+            (StatusCode::NOT_FOUND, self.to_string())
+        } else {
+            match self {
+                Error::Unknown => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+                Error::Timeout => (StatusCode::REQUEST_TIMEOUT, self.to_string()),
+                _ => (StatusCode::BAD_REQUEST, self.to_string()),
             }
-            _ => (StatusCode::BAD_REQUEST, self.to_string()),
         };
         let mut res = message.into_response();
         res.headers_mut()
@@ -84,12 +74,12 @@ pub async fn handle_error(
     error!(
         method = %method,
         uri = %uri,
-        error = %err
+        error = %err,
+        "unhandled internal error",
     );
     if err.is::<tower::timeout::error::Elapsed>() {
         return Error::Timeout;
     }
-    Error::Unknown {
-        message: err.to_string(),
-    }
+    // Optimization: Return a generic error to the user, avoiding detail leakage.
+    Error::Unknown
 }

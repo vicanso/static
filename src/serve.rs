@@ -21,7 +21,7 @@ use bstr::ByteSlice;
 use bytesize::ByteSize;
 use once_cell::sync::Lazy;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -147,6 +147,8 @@ pub struct StaticServeParams {
     pub autoindex: bool,
     pub cache_control: String,
     pub html_replaces: Vec<(Vec<u8>, Vec<u8>)>,
+    pub cache_size: usize,
+    pub cache_ttl: Duration,
 }
 
 #[derive(Clone)]
@@ -161,46 +163,42 @@ struct FileInfo {
     body: Option<Vec<u8>>,
 }
 
-static STATIC_CACHE_TTL: LazyLock<Duration> = LazyLock::new(|| {
-    let value = std::env::var("STATIC_CACHE_TTL").unwrap_or("10m".to_string());
-    humantime::parse_duration(&value).unwrap_or(Duration::from_secs(10 * 60))
-});
+// static STATIC_CACHE_TTL: LazyLock<Duration> = LazyLock::new(|| {
+//     let value = std::env::var("STATIC_CACHE_TTL").unwrap_or_default();
+//     humantime::parse_duration(&value).unwrap_or(Duration::from_secs(10 * 60))
+// });
 
-static STATIC_CACHE_SIZE: LazyLock<usize> = LazyLock::new(|| {
-    let value = std::env::var("STATIC_CACHE_SIZE").unwrap_or("1024".to_string());
-    value.parse::<usize>().unwrap_or(1024)
-});
+// static STATIC_CACHE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+//     let value = std::env::var("STATIC_CACHE_SIZE").unwrap_or_default();
+//     value.parse::<usize>().unwrap_or(1024)
+// });
 
-static STATIC_CACHE: LazyLock<TinyUfo<String, FileInfoCache>> =
-    LazyLock::new(|| TinyUfo::new(*STATIC_CACHE_SIZE, *STATIC_CACHE_SIZE));
+static STATIC_CACHE: OnceLock<TinyUfo<String, FileInfoCache>> = OnceLock::new();
 
-fn get_file_from_cache(file: &String) -> Option<FileInfo> {
-    if *STATIC_CACHE_SIZE == 0 {
-        return None;
-    }
-    if let Some(info) = STATIC_CACHE.get(file) {
-        if info.expired_at
+fn get_static_cache(size: usize) -> &'static TinyUfo<String, FileInfoCache> {
+    STATIC_CACHE.get_or_init(|| TinyUfo::new(size, size))
+}
+
+fn get_file_from_cache(file: &String, cache_size: usize) -> Option<FileInfo> {
+    if let Some(info) = get_static_cache(cache_size).get(file)
+        && info.expired_at
             > SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()
-        {
-            return Some(info.data.clone());
-        }
+    {
+        return Some(info.data.clone());
     }
     None
 }
 
-fn set_file_to_cache(file: &str, info: &FileInfo) {
-    if *STATIC_CACHE_SIZE == 0 {
-        return;
-    }
+fn set_file_to_cache(file: &str, info: &FileInfo, cache_size: usize, cache_ttl: Duration) {
     let expired_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-        + STATIC_CACHE_TTL.as_secs();
-    STATIC_CACHE.put(
+        + cache_ttl.as_secs();
+    get_static_cache(cache_size).put(
         file.to_string(),
         FileInfoCache {
             expired_at,
@@ -212,7 +210,9 @@ fn set_file_to_cache(file: &str, info: &FileInfo) {
 
 async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     let mut file = params.file.clone();
-    if let Some(info) = get_file_from_cache(&file) {
+    if params.cache_size > 0
+        && let Some(info) = get_file_from_cache(&file, params.cache_size)
+    {
         return Ok(info);
     }
 
@@ -303,8 +303,8 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         None
     };
     let info = FileInfo { headers, body };
-    if !is_html && info.body.is_some() {
-        set_file_to_cache(&file, &info);
+    if params.cache_size > 0 && !is_html && info.body.is_some() {
+        set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
     }
 
     Ok(info)
