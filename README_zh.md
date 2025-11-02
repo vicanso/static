@@ -1,8 +1,7 @@
 # static
 
 - `STATIC_THREADS`: `tokio` 的 `worker` 线程数，默认为 CPU 核心数。
-- `STATIC_SERVICE`: 存储服务，默认为 `fs`，支持 `fs`、`s3` 等。
-- `STATIC_PATH`: 静态文件路径，默认为 `/static`。如果 `STATIC_SERVICE` 为 `s3`，则其值为 `https://s3.amazonaws.com?bucket=static&region=us-east-1&access_key_id=***&secret_access_key=***`。
+- `STATIC_PATH`: 静态文件路径，默认为 `/static`。如果 `STATIC_PATH` 以 `https://` 或 `http://` 开头，则认为是 `s3` 服务，其值为 `https://s3.amazonaws.com?bucket=static&region=us-east-1&access_key_id=***&secret_access_key=***`。如果 `STATIC_PATH` 以 `ftp://` 开头，则认为是 `ftp` 服务，其值为 `ftp://user:password@ftp.example.com`。如果 `STATIC_PATH` 以 `mongodb://` 开头，则认为是 `gridfs` 服务，其值为 `mongodb://user:password@mongodb1.example.com:27317,mongodb2.example.com:27017/?connectTimeoutMS=300000&replicaSet=mySet`。
 - `STATIC_LISTEN_ADDR`: 监听地址，默认为 `127.0.0.1:3000`。
 - `STATIC_TIMEOUT`: 超时时间，默认为 `30s`。
 - `STATIC_COMPRESS_MIN_LENGTH`: 启用压缩的最小长度，默认为 `256`。

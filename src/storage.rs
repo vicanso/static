@@ -115,12 +115,16 @@ fn new_gridfs_dal(url: &str) -> Result<Storage> {
 
 pub fn get_storage() -> Result<&'static Storage> {
     let storage = STORAGE.get_or_try_init(|| {
-        let static_service = std::env::var("STATIC_SERVICE").unwrap_or_default();
         let static_path = std::env::var("STATIC_PATH").unwrap_or("/static".to_string());
-        match static_service.as_str() {
-            "s3" => new_s3_dal(&static_path),
-            "ftp" => new_ftp_dal(&static_path),
-            "gridfs" => new_gridfs_dal(&static_path),
+
+        match static_path {
+            static_path
+                if static_path.starts_with("https://") || static_path.starts_with("http://") =>
+            {
+                new_s3_dal(&static_path)
+            }
+            static_path if static_path.starts_with("ftp://") => new_ftp_dal(&static_path),
+            static_path if static_path.starts_with("mongodb://") => new_gridfs_dal(&static_path),
             _ => {
                 let opendal = opendal::services::Fs::default().root(static_path.as_str());
                 let dal = opendal::Operator::new(opendal)

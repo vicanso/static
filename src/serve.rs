@@ -28,7 +28,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
 pub static X_ORIGINAL_SIZE_HEADER_NAME: Lazy<HeaderName> =
-    Lazy::new(|| HeaderName::from_bytes(b"X-Original-Size").unwrap());
+    Lazy::new(|| HeaderName::from_static("X-Original-Size"));
 
 // Static HTML template for directory listing view
 // Includes basic styling and JavaScript for date formatting

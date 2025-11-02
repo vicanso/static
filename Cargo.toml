@@ -3,6 +3,10 @@ name = "static-serve"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+# Set the unwrap_used lint level to deny
+unwrap_used = "deny"
+
 [dependencies]
 TinyUFO = "0.6.0"
 axum = "0.8.6"

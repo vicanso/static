@@ -75,7 +75,7 @@ async fn shutdown_signal() {
     info!("signal received, starting graceful shutdown");
 }
 
-async fn run(config: Arc<Config>) {
+async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health_check))
         .fallback(get(serve))
@@ -87,10 +87,7 @@ async fn run(config: Arc<Config>) {
         .layer(HandleErrorLayer::new(handle_error));
     let size = config.compress_min_length;
     let app = if size > 0 {
-        let predicate = SizeAbove::new(size)
-            .and(NotForContentType::GRPC)
-            .and(NotForContentType::IMAGES)
-            .and(NotForContentType::SSE);
+        let predicate = SizeAbove::new(size).and(NotForContentType::IMAGES);
         app.layer(
             builder
                 .layer(CompressionLayer::new().compress_when(predicate))
@@ -100,9 +97,7 @@ async fn run(config: Arc<Config>) {
         app.layer(builder.timeout(config.timeout))
     };
 
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     info!("server running on http://{}", config.listen_addr);
 
     axum::serve(
@@ -110,8 +105,8 @@ async fn run(config: Arc<Config>) {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
-    .await
-    .unwrap();
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +133,7 @@ where
             return Ok(ClientIp(ip));
         }
         if let Some(x_real_ip) = parts.headers.get("X-Real-Ip")
-            && let Ok(ip) = x_real_ip.to_str().unwrap().parse::<IpAddr>()
+            && let Ok(ip) = x_real_ip.to_str().unwrap_or_default().parse::<IpAddr>()
         {
             return Ok(ClientIp(ip));
         }
@@ -264,7 +259,7 @@ fn init_logger() {
     }
     let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339().unwrap_or_else(|_| {
         tracing_subscriber::fmt::time::OffsetTime::new(
-            time::UtcOffset::from_hms(0, 0, 0).unwrap(),
+            time::UtcOffset::from_hms(0, 0, 0).unwrap_or(time::UtcOffset::UTC),
             time::format_description::well_known::Rfc3339,
         )
     });
@@ -287,10 +282,10 @@ fn main() {
         config = ?config,
         "starting static server",
     );
-    tokio::runtime::Builder::new_multi_thread()
+    let _ = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(cpus)
         .build()
-        .unwrap()
+        .unwrap_or_else(|e| panic!("failed to build tokio runtime: {}", e))
         .block_on(run(config));
 }
