@@ -28,7 +28,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
 pub static X_ORIGINAL_SIZE_HEADER_NAME: Lazy<HeaderName> =
-    Lazy::new(|| HeaderName::from_static("X-Original-Size"));
+    Lazy::new(|| HeaderName::from_static("x-original-size"));
 
 // Static HTML template for directory listing view
 // Includes basic styling and JavaScript for date formatting
@@ -163,16 +163,6 @@ struct FileInfo {
     body: Option<Vec<u8>>,
 }
 
-// static STATIC_CACHE_TTL: LazyLock<Duration> = LazyLock::new(|| {
-//     let value = std::env::var("STATIC_CACHE_TTL").unwrap_or_default();
-//     humantime::parse_duration(&value).unwrap_or(Duration::from_secs(10 * 60))
-// });
-
-// static STATIC_CACHE_SIZE: LazyLock<usize> = LazyLock::new(|| {
-//     let value = std::env::var("STATIC_CACHE_SIZE").unwrap_or_default();
-//     value.parse::<usize>().unwrap_or(1024)
-// });
-
 static STATIC_CACHE: OnceLock<TinyUfo<String, FileInfoCache>> = OnceLock::new();
 
 fn get_static_cache(size: usize) -> &'static TinyUfo<String, FileInfoCache> {
@@ -258,14 +248,15 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
                 .to_string()
         });
     let mut is_html = false;
-    if content_type.contains("text/html") {
+    let cache_control = if content_type.contains("text/html") {
         is_html = true;
-        headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
+        "no-cache"
     } else if let Some(cache_control) = meta.cache_control() {
-        headers.push((header::CACHE_CONTROL, cache_control.to_string()));
+        cache_control
     } else {
-        headers.push((header::CACHE_CONTROL, params.cache_control.clone()));
-    }
+        &params.cache_control
+    };
+    headers.push((header::CACHE_CONTROL, cache_control.to_string()));
     headers.push((header::CONTENT_TYPE, content_type));
     if let Some(content_encoding) = meta.content_encoding() {
         headers.push((header::CONTENT_ENCODING, content_encoding.to_string()));
@@ -273,18 +264,24 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
 
     let size = meta.content_length();
     // Generate ETag based on file size and modification time
-    if let Some(etag) = meta.etag() {
-        headers.push((header::ETAG, etag.to_string()));
+    let etag = if let Some(etag) = meta.etag() {
+        Some(etag.to_string())
     } else if let Some(last_modified) = meta.last_modified() {
         let value = last_modified.timestamp();
         if value > 0 {
-            let etag = format!(r#"W/"{size:x}-{value:x}""#);
-            headers.push((header::ETAG, etag));
+            Some(format!(r#"W/"{size:x}-{value:x}""#))
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    if let Some(etag) = etag {
+        headers.push((header::ETAG, etag));
     }
-    if size > 0 {
-        headers.push((X_ORIGINAL_SIZE_HEADER_NAME.clone(), size.to_string()));
-    }
+
+    headers.push((X_ORIGINAL_SIZE_HEADER_NAME.clone(), size.to_string()));
+    headers.push((header::CONTENT_LENGTH, size.to_string()));
 
     // read html or small file
     let body = if is_html || size < 30 * 1024 {

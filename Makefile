@@ -1,5 +1,5 @@
 dev:
-	RUST_LOG=INFO cargo watch -w src -x 'run --'
+	STATIC_PATH=~/Downloads RUST_LOG=INFO cargo watch -w src -x 'run --'
 
 lint:
 	typos
