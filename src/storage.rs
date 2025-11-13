@@ -15,13 +15,34 @@
 use crate::error::Error;
 use once_cell::sync::OnceCell;
 use opendal::{Operator, layers::MimeGuessLayer};
+use path_absolutize::Absolutize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use url::Url;
 
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct Storage {
     pub dal: Operator,
+    root: Option<PathBuf>,
+}
+
+impl Storage {
+    pub fn validate(&self, file: &str) -> Result<()> {
+        if let Some(root_path) = &self.root {
+            let full_path = root_path.join(file);
+
+            let validated_path = full_path.absolutize().map_err(|e| Error::InvalidFile {
+                message: e.to_string(),
+            })?;
+            if !validated_path.starts_with(&root_path) {
+                return Err(Error::InvalidFile {
+                    message: format!("Path traversal attempt blocked, file: {file}"),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 static STORAGE: OnceCell<Storage> = OnceCell::new();
@@ -82,7 +103,7 @@ fn new_s3_dal(url: &str) -> Result<Storage> {
         .map_err(|e| Error::Openedal { source: e })?
         .layer(MimeGuessLayer::default())
         .finish();
-    Ok(Storage { dal })
+    Ok(Storage { dal, root: None })
 }
 
 fn new_ftp_dal(url: &str) -> Result<Storage> {
@@ -101,7 +122,7 @@ fn new_ftp_dal(url: &str) -> Result<Storage> {
         .map_err(|e| Error::Openedal { source: e })?
         .layer(MimeGuessLayer::default())
         .finish();
-    Ok(Storage { dal })
+    Ok(Storage { dal, root: None })
 }
 
 fn new_gridfs_dal(url: &str) -> Result<Storage> {
@@ -110,7 +131,7 @@ fn new_gridfs_dal(url: &str) -> Result<Storage> {
         .map_err(|e| Error::Openedal { source: e })?
         .layer(MimeGuessLayer::default())
         .finish();
-    Ok(Storage { dal })
+    Ok(Storage { dal, root: None })
 }
 
 pub fn get_storage() -> Result<&'static Storage> {
@@ -131,7 +152,10 @@ pub fn get_storage() -> Result<&'static Storage> {
                     .map_err(|e| Error::Openedal { source: e })?
                     .layer(MimeGuessLayer::default())
                     .finish();
-                Ok(Storage { dal })
+                Ok(Storage {
+                    dal,
+                    root: Some(PathBuf::from(static_path)),
+                })
             }
         }
     })?;

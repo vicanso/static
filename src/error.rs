@@ -23,6 +23,8 @@ use tracing::error;
 pub enum Error {
     #[snafu(display("An internal server error occurred"))]
     Unknown,
+    #[snafu(display("Invalid file: {message}"))]
+    InvalidFile { message: String },
     #[snafu(display("Request timed out"))]
     Timeout,
     #[snafu(display("File not found: {file}"))]

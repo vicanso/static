@@ -205,8 +205,10 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     {
         return Ok(info);
     }
+    let storage = get_storage()?;
+    storage.validate(&file)?;
 
-    let mut meta = get_storage()?
+    let mut meta = storage
         .dal
         .stat(&file)
         .await
