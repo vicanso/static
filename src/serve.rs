@@ -122,7 +122,7 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
         if meta.is_file() {
             size = ByteSize(meta.content_length()).to_string();
             if let Some(value) = meta.last_modified() {
-                last_modified = value.timestamp().to_string();
+                last_modified = value.to_string();
             }
         }
 
@@ -269,7 +269,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     let etag = if let Some(etag) = meta.etag() {
         Some(etag.to_string())
     } else if let Some(last_modified) = meta.last_modified() {
-        let value = last_modified.timestamp();
+        let value = last_modified.into_inner().as_millisecond();
         if value > 0 {
             Some(format!(r#"W/"{size:x}-{value:x}""#))
         } else {

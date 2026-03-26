@@ -1,6 +1,6 @@
 [package]
 name = "static-serve"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 
 [lints.clippy]
@@ -8,15 +8,15 @@ edition = "2024"
 unwrap_used = "deny"
 
 [dependencies]
-TinyUFO = "0.6.0"
-axum = "0.8.6"
-bstr = "1.12.0"
-bytesize = "2.1.0"
+TinyUFO = "0.8.0"
+axum = "0.8.8"
+bstr = "1.12.1"
+bytesize = "2.3.1"
 humantime = "2.3.0"
 mime_guess = "2.0.5"
 num_cpus = "1.17.0"
-once_cell = "1.21.3"
-opendal = { version = "0.54.1", features = [
+once_cell = "1.21.4"
+opendal = { version = "0.55.0", features = [
     "services-fs",
     "services-ftp",
     "services-gridfs",
@@ -24,20 +24,20 @@ opendal = { version = "0.54.1", features = [
     "layers-mime-guess",
 ] }
 path-absolutize = "3.1.1"
-snafu = "0.8.9"
+snafu = "0.9.0"
 substring = "1.4.5"
-time = "0.3.44"
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "signal"] }
-tokio-util = { version = "0.7.16", features = ["compat"] }
-tower = { version = "0.5.2", features = ["timeout"] }
-tower-http = { version = "0.6.6", features = [
+time = "0.3.47"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "signal"] }
+tokio-util = { version = "0.7.18", features = ["compat"] }
+tower = { version = "0.5.3", features = ["timeout"] }
+tower-http = { version = "0.6.8", features = [
     "compression-br",
     "compression-gzip",
     "compression-zstd",
 ] }
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["local-time"] }
-url = "2.5.7"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["local-time"] }
+url = "2.5.8"
 urlencoding = "2.1.3"
 
 [profile.release]

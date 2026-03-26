@@ -35,7 +35,7 @@ impl Storage {
             let validated_path = full_path.absolutize().map_err(|e| Error::InvalidFile {
                 message: e.to_string(),
             })?;
-            if !validated_path.starts_with(&root_path) {
+            if !validated_path.starts_with(root_path) {
                 return Err(Error::InvalidFile {
                     message: format!("Path traversal attempt blocked, file: {file}"),
                 });
