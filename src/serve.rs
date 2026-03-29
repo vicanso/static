@@ -14,6 +14,7 @@
 
 use crate::error::{Error, Result};
 use crate::storage::get_storage;
+use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
@@ -71,7 +72,7 @@ static WEB_HTML: &str = r###"<!doctype html>
                 if (index == 0) {
                     return;
                 }
-                const ts = item.innerHTM;
+                const ts = item.innerHTML;
                 if (!ts) {
                     item.innerHTML = "--";
                     return;
@@ -146,7 +147,7 @@ pub struct StaticServeParams {
     pub index: String,
     pub autoindex: bool,
     pub cache_control: String,
-    pub html_replaces: Vec<(Vec<u8>, Vec<u8>)>,
+    pub html_replaces: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
     pub cache_size: usize,
     pub cache_ttl: Duration,
 }
@@ -159,7 +160,7 @@ struct FileInfoCache {
 
 #[derive(Clone)]
 struct FileInfo {
-    headers: Vec<(HeaderName, String)>,
+    headers: Vec<(HeaderName, HeaderValue)>,
     body: Option<Vec<u8>>,
 }
 
@@ -222,12 +223,16 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
 
     if is_dir && params.autoindex {
         let html = get_autoindex_html(&file).await?;
-        headers.push((header::CONTENT_TYPE, "text/html".to_string()));
-        headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
-        return Ok(FileInfo {
+        headers.push((header::CONTENT_TYPE, HeaderValue::from_static("text/html")));
+        headers.push((header::CACHE_CONTROL, HeaderValue::from_static("no-cache")));
+        let info = FileInfo {
             headers,
             body: Some(html.into_bytes()),
-        });
+        };
+        if params.cache_size > 0 {
+            set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
+        }
+        return Ok(info);
     }
     if is_dir && !params.index.is_empty() {
         file = if file.ends_with("/") {
@@ -235,7 +240,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         } else {
             format!("{file}/{}", params.index)
         };
-        meta = get_storage()?
+        meta = storage
             .dal
             .stat(&file)
             .await
@@ -258,10 +263,16 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     } else {
         &params.cache_control
     };
-    headers.push((header::CACHE_CONTROL, cache_control.to_string()));
-    headers.push((header::CONTENT_TYPE, content_type));
+    if let Ok(v) = HeaderValue::try_from(cache_control) {
+        headers.push((header::CACHE_CONTROL, v));
+    }
+    if let Ok(v) = HeaderValue::try_from(content_type) {
+        headers.push((header::CONTENT_TYPE, v));
+    }
     if let Some(content_encoding) = meta.content_encoding() {
-        headers.push((header::CONTENT_ENCODING, content_encoding.to_string()));
+        if let Ok(v) = HeaderValue::try_from(content_encoding.to_string()) {
+            headers.push((header::CONTENT_ENCODING, v));
+        }
     }
 
     let size = meta.content_length();
@@ -279,23 +290,31 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         None
     };
     if let Some(etag) = etag {
-        headers.push((header::ETAG, etag));
+        if let Ok(v) = HeaderValue::try_from(etag) {
+            headers.push((header::ETAG, v));
+        }
     }
 
-    headers.push((X_ORIGINAL_SIZE_HEADER_NAME.clone(), size.to_string()));
-    headers.push((header::CONTENT_LENGTH, size.to_string()));
+    // size.to_string() is decimal digits — always a valid HeaderValue
+    if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+        headers.push((X_ORIGINAL_SIZE_HEADER_NAME.clone(), v.clone()));
+        headers.push((header::CONTENT_LENGTH, v));
+    }
 
     // read html or small file
     let body = if is_html || size < 30 * 1024 {
-        let mut buf = get_storage()?
+        let mut buf = storage
             .dal
             .read(&file)
             .await
             .map_err(|e| Error::Openedal { source: e })?
             .to_vec();
 
-        for (key, value) in params.html_replaces.iter() {
-            buf = buf.replace(key, value);
+        // Only apply HTML replacements to HTML content
+        if is_html {
+            for (key, value) in params.html_replaces.iter() {
+                buf = buf.replace(key, value);
+            }
         }
         Some(buf)
     } else {
@@ -331,12 +350,9 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         body.into_response()
     };
 
-    file_info.headers.iter().for_each(|(k, v)| {
-        let Ok(value) = HeaderValue::from_str(v) else {
-            return;
-        };
-        resp.headers_mut().insert(k, value);
-    });
+    for (k, v) in file_info.headers {
+        resp.headers_mut().insert(k, v);
+    }
 
     Ok(resp)
 }

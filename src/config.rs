@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -25,7 +26,7 @@ pub struct Config {
     pub cache_control: String,
     pub fallback_index_404: bool,
     pub fallback_html_404: bool,
-    pub html_replaces: Vec<(Vec<u8>, Vec<u8>)>,
+    pub html_replaces: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
     pub response_headers: HeaderMap,
     pub cache_size: usize,
     pub cache_ttl: Duration,
@@ -78,7 +79,7 @@ impl Config {
                 .unwrap_or_default()
                 .parse()
                 .unwrap_or(false),
-            html_replaces,
+            html_replaces: Arc::new(html_replaces),
             response_headers,
             cache_size: std::env::var("STATIC_CACHE_SIZE")
                 .unwrap_or_default()

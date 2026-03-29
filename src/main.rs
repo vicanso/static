@@ -180,12 +180,6 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
     response
 }
 
-enum HandleCategory {
-    Normal,
-    ExtHtml,
-    IndexHtml,
-}
-
 // 处理函数
 async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> {
     let path = uri.path();
@@ -200,23 +194,19 @@ async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> 
         file
     };
 
-    let mut category_list = vec![HandleCategory::Normal];
-    if config.fallback_html_404 {
-        category_list.push(HandleCategory::ExtHtml);
-    }
-    if config.fallback_index_404 {
-        category_list.push(HandleCategory::IndexHtml);
-    }
-    let mut err = Error::NotFound { file: file.clone() };
+    let index = config.index_file.clone();
+    let mut last_err = Error::NotFound { file: file.clone() };
 
-    for category in category_list {
-        let current_file = match category {
-            HandleCategory::Normal => file.clone(),
-            HandleCategory::ExtHtml => format!("{file}.html"),
-            HandleCategory::IndexHtml => config.index_file.clone(),
-        };
-        err = match static_serve(StaticServeParams {
-            index: config.index_file.clone(),
+    for current_file in [
+        Some(file.clone()),
+        config.fallback_html_404.then(|| format!("{file}.html")),
+        config.fallback_index_404.then(|| index.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match static_serve(StaticServeParams {
+            index: index.clone(),
             autoindex: config.autoindex,
             cache_control: config.cache_control.clone(),
             html_replaces: config.html_replaces.clone(),
@@ -232,14 +222,13 @@ async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> 
                 }
                 return Ok(response);
             }
-            Err(e) => e,
-        };
-        if err.is_not_found() {
-            continue;
+            Err(e) if e.is_not_found() => {
+                last_err = e;
+            }
+            Err(e) => return Err(e),
         }
-        return Err(err);
     }
-    Err(err)
+    Err(last_err)
 }
 
 async fn health_check() -> (StatusCode, &'static str) {
