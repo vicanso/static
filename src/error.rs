@@ -13,28 +13,33 @@
 // limitations under the License.
 
 use axum::BoxError;
-use axum::http::HeaderValue;
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use snafu::Snafu;
-use tracing::error;
+use tracing::{error, warn};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("An internal server error occurred"))]
     Unknown,
+
     #[snafu(display("Invalid file: {message}"))]
     InvalidFile { message: String },
+
     #[snafu(display("Request timed out"))]
     Timeout,
+
     #[snafu(display("File not found: {file}"))]
     NotFound { file: String },
-    #[snafu(display("Openedal error: {source}"))]
+
+    #[snafu(display("OpenDAL error: {source}"))]
+    #[snafu(context(false))]
     Openedal { source: opendal::Error },
+
     #[snafu(display("Parse url error: {source}"))]
+    #[snafu(context(false))]
     ParseUrl { source: url::ParseError },
 }
-
 impl Error {
     /// Checks if the error variant represents a "not found" condition.
     pub fn is_not_found(&self) -> bool {
@@ -50,19 +55,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let (status, message) = if self.is_not_found() {
-            (StatusCode::NOT_FOUND, self.to_string())
+        let status = if self.is_not_found() {
+            StatusCode::NOT_FOUND
         } else {
             match self {
-                Error::Unknown => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
-                Error::Timeout => (StatusCode::REQUEST_TIMEOUT, self.to_string()),
-                _ => (StatusCode::BAD_REQUEST, self.to_string()),
+                Error::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::Timeout => StatusCode::REQUEST_TIMEOUT,
+                _ => StatusCode::BAD_REQUEST,
             }
         };
-        let mut res = message.into_response();
-        res.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        (status, res).into_response()
+
+        (
+            status,
+            [(header::CACHE_CONTROL, "no-cache")],
+            self.to_string(),
+        )
+            .into_response()
     }
 }
 
@@ -73,15 +81,16 @@ pub async fn handle_error(
     // the last argument must be the error itself
     err: BoxError,
 ) -> Error {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        warn!(method = %method, uri = %uri, "request timed out");
+        return Error::Timeout;
+    }
     error!(
         method = %method,
         uri = %uri,
         error = %err,
         "unhandled internal error",
     );
-    if err.is::<tower::timeout::error::Elapsed>() {
-        return Error::Timeout;
-    }
     // Optimization: Return a generic error to the user, avoiding detail leakage.
     Error::Unknown
 }

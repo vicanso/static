@@ -14,7 +14,7 @@
 
 use crate::error::Error;
 use once_cell::sync::OnceCell;
-use opendal::{Operator, layers::MimeGuessLayer};
+use opendal::{Builder, Operator, layers::MimeGuessLayer};
 use path_absolutize::Absolutize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,19 +57,18 @@ struct StorageParams {
 
 fn parse_params(url: &str) -> Result<StorageParams> {
     let info = Url::parse(url).map_err(|e| Error::ParseUrl { source: e })?;
-    let mut endpoint = format!(
-        "{}://{}",
+    let port_str = info.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let endpoint = format!(
+        "{}://{}{}",
         info.scheme(),
-        info.host().map(|v| v.to_string()).unwrap_or_default()
+        info.host_str().unwrap_or_default(),
+        port_str
     );
-    if let Some(port) = info.port() {
-        endpoint = format!("{endpoint}:{port}");
-    }
 
-    let mut query = HashMap::new();
-    info.query_pairs().for_each(|(k, v)| {
-        query.insert(k.to_string(), v.to_string());
-    });
+    let query = info
+        .query_pairs()
+        .into_owned()
+        .collect::<HashMap<String, String>>();
 
     Ok(StorageParams {
         user: info.username().to_string(),
@@ -78,6 +77,14 @@ fn parse_params(url: &str) -> Result<StorageParams> {
         path: info.path().to_string(),
         query,
     })
+}
+
+fn build_operator<B: Builder>(builder: B) -> Result<Operator> {
+    let dal = Operator::new(builder)
+        .map_err(|e| Error::Openedal { source: e })?
+        .layer(MimeGuessLayer::default())
+        .finish();
+    Ok(dal)
 }
 
 fn new_s3_dal(url: &str) -> Result<Storage> {
@@ -99,11 +106,10 @@ fn new_s3_dal(url: &str) -> Result<Storage> {
         builder = builder.secret_access_key(secret_access_key);
     }
 
-    let dal = opendal::Operator::new(builder)
-        .map_err(|e| Error::Openedal { source: e })?
-        .layer(MimeGuessLayer::default())
-        .finish();
-    Ok(Storage { dal, root: None })
+    Ok(Storage {
+        dal: build_operator(builder)?,
+        root: None,
+    })
 }
 
 fn new_ftp_dal(url: &str) -> Result<Storage> {
@@ -118,25 +124,23 @@ fn new_ftp_dal(url: &str) -> Result<Storage> {
     if let Some(password) = params.password {
         builder = builder.password(&password);
     }
-    let dal = opendal::Operator::new(builder)
-        .map_err(|e| Error::Openedal { source: e })?
-        .layer(MimeGuessLayer::default())
-        .finish();
-    Ok(Storage { dal, root: None })
+    Ok(Storage {
+        dal: build_operator(builder)?,
+        root: None,
+    })
 }
 
 fn new_gridfs_dal(url: &str) -> Result<Storage> {
     let builder = opendal::services::Gridfs::default().connection_string(url);
-    let dal = opendal::Operator::new(builder)
-        .map_err(|e| Error::Openedal { source: e })?
-        .layer(MimeGuessLayer::default())
-        .finish();
-    Ok(Storage { dal, root: None })
+    Ok(Storage {
+        dal: build_operator(builder)?,
+        root: None,
+    })
 }
 
 pub fn get_storage() -> Result<&'static Storage> {
-    let storage = STORAGE.get_or_try_init(|| {
-        let static_path = std::env::var("STATIC_PATH").unwrap_or("/static".to_string());
+    STORAGE.get_or_try_init(|| {
+        let static_path = std::env::var("STATIC_PATH").unwrap_or_else(|_| "/static".to_string());
 
         match static_path {
             static_path
@@ -158,6 +162,5 @@ pub fn get_storage() -> Result<&'static Storage> {
                 })
             }
         }
-    })?;
-    Ok(storage)
+    })
 }

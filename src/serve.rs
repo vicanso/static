@@ -18,8 +18,10 @@ use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bstr::ByteSlice;
+use bytes::Bytes;
 use bytesize::ByteSize;
 use once_cell::sync::Lazy;
+use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -104,12 +106,12 @@ static WEB_HTML: &str = r###"<!doctype html>
 "###;
 
 async fn get_autoindex_html(path: &str) -> Result<String> {
-    let mut file_list_html = vec![];
     let entry_list = get_storage()?
         .dal
         .list(path)
         .await
         .map_err(|e| Error::Openedal { source: e })?;
+    let mut html_rows = String::with_capacity(entry_list.len() * 128);
     for entry in entry_list {
         let filepath = entry.path();
         let name = entry.name();
@@ -127,18 +129,17 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
             }
         }
 
-        let target = format!("./{filepath}");
-
-        file_list_html.push(format!(
+        let _ = write!(
+            html_rows,
             r###"<tr>
-                <td class="name"><a href="{target}">{name}</a></td>
+                <td class="name"><a href="./{filepath}">{name}</a></td>
                 <td class="size">{size}</td>
                 <td class="lastModified">{last_modified}</td>
             </tr>"###
-        ));
+        );
     }
 
-    Ok(WEB_HTML.replace("{{CONTENT}}", &file_list_html.join("\n")))
+    Ok(WEB_HTML.replace("{{CONTENT}}", &html_rows))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,7 +165,7 @@ struct FileInfoCache {
 #[derive(Clone)]
 struct FileInfo {
     headers: Vec<(HeaderName, HeaderValue)>,
-    body: Option<Vec<u8>>,
+    body: Option<Bytes>,
     size: u64,
     read_file: String,
 }
@@ -231,7 +232,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         let html = get_autoindex_html(&file).await?;
         headers.push((header::CONTENT_TYPE, HeaderValue::from_static("text/html")));
         headers.push((header::CACHE_CONTROL, HeaderValue::from_static("no-cache")));
-        let body = html.into_bytes();
+        let body = Bytes::from(html);
         let info = FileInfo {
             size: body.len() as u64,
             headers,
@@ -347,7 +348,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
                 buf = buf.replace(key, value);
             }
         }
-        Some(buf)
+        Some(Bytes::from(buf))
     } else {
         None
     };
@@ -418,8 +419,8 @@ fn parse_range(range_header: &str, total_size: u64) -> Option<RangeValue> {
 
 // 处理函数
 pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
-    let file_info = get_file(&params).await?;
-    let read_file = file_info.read_file.clone();
+    let mut file_info = get_file(&params).await?;
+    let read_file = std::mem::take(&mut file_info.read_file);
     let total_size = file_info
         .body
         .as_ref()
@@ -433,12 +434,11 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         let etag_str = etag_value.to_str().unwrap_or_default();
         if if_none_match == "*" || if_none_match.split(',').any(|v| v.trim() == etag_str) {
             let mut resp = StatusCode::NOT_MODIFIED.into_response();
-            for (k, v) in file_info.headers {
-                if k == header::CONTENT_LENGTH || k == header::CONTENT_ENCODING {
-                    continue;
-                }
-                resp.headers_mut().insert(k, v);
-            }
+            resp.headers_mut().extend(
+                file_info.headers.into_iter().filter(|(k, _)| {
+                    *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING
+                }),
+            );
             return Ok(resp);
         }
     }
@@ -456,11 +456,12 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
             HeaderValue::try_from(format!("bytes */{total_size}"))
                 .unwrap_or_else(|_| HeaderValue::from_static("bytes */*")),
         );
-        for (k, v) in file_info.headers {
-            if k != header::CONTENT_LENGTH {
-                resp.headers_mut().insert(k, v);
-            }
-        }
+        resp.headers_mut().extend(
+            file_info
+                .headers
+                .into_iter()
+                .filter(|(k, _)| *k != header::CONTENT_LENGTH),
+        );
         return Ok(resp);
     }
 
@@ -468,8 +469,8 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
 
     let mut resp = if let Some(RangeValue::Satisfiable(start, end)) = range {
         let content_length = end - start + 1;
-        let mut resp = if let Some(body) = file_info.body {
-            body[start as usize..=end as usize].to_vec().into_response()
+        let mut resp = if let Some(body) = file_info.body.take() {
+            body.slice(start as usize..=end as usize).into_response()
         } else {
             let r = get_storage()?
                 .dal
@@ -497,7 +498,7 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         );
         resp
     } else {
-        if let Some(body) = file_info.body {
+        if let Some(body) = file_info.body.take() {
             body.into_response()
         } else {
             let r = get_storage()?
@@ -515,12 +516,12 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         }
     };
 
-    for (k, v) in file_info.headers {
-        if is_partial && k == header::CONTENT_LENGTH {
-            continue;
-        }
-        resp.headers_mut().insert(k, v);
-    }
+    resp.headers_mut().extend(
+        file_info
+            .headers
+            .into_iter()
+            .filter(|(k, _)| !(is_partial && *k == header::CONTENT_LENGTH)),
+    );
 
     Ok(resp)
 }
