@@ -1,6 +1,9 @@
 dev:
 	STATIC_PATH=~/Downloads RUST_LOG=INFO cargo watch -w src -x 'run --'
 
+fmt:
+	cargo fmt
+
 lint:
 	typos
 	cargo clippy --all-targets --all -- --deny=warnings

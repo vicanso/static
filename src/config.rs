@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{error, warn};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -30,13 +32,75 @@ pub struct Config {
     pub response_headers: HeaderMap,
     pub cache_size: usize,
     pub cache_ttl: Duration,
+    pub not_modified: bool,
+    pub precompressed: bool,
+    pub threads: usize,
+}
+
+fn deserialize_humantime<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(default)]
+struct EnvConfig {
+    #[serde(deserialize_with = "deserialize_humantime")]
+    timeout: Duration,
+    compress_min_length: u16,
+    index_file: String,
+    autoindex: bool,
+    listen_addr: String,
+    cache_control: String,
+    fallback_index_404: bool,
+    fallback_html_404: bool,
+    cache_size: usize,
+    #[serde(deserialize_with = "deserialize_humantime")]
+    cache_ttl: Duration,
+    not_modified: bool,
+    precompressed: bool,
+    threads: usize,
+}
+
+impl Default for EnvConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            compress_min_length: 256,
+            index_file: "index.html".to_string(),
+            autoindex: false,
+            listen_addr: "0.0.0.0:3000".to_string(),
+            cache_control: "public, max-age=31536000, immutable".to_string(),
+            fallback_index_404: false,
+            fallback_html_404: false,
+            cache_size: 1024,
+            cache_ttl: Duration::from_secs(10 * 60),
+            not_modified: false,
+            precompressed: false,
+            threads: num_cpus::get(),
+        }
+    }
 }
 
 impl Config {
     pub fn new() -> Self {
+        let env_cfg = match envy::prefixed("STATIC_").from_env::<EnvConfig>() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                error!(
+                    "Failed to parse static configs from env: {}. Using defaults.",
+                    e
+                );
+                EnvConfig::default()
+            }
+        };
+
+        // 2. 处理动态键名的配置 (Headers 和 Replaces)
         let mut html_replaces = vec![];
         let mut response_headers = HeaderMap::new();
-
         let replace_prefix = "STATIC_HTML_REPLACE_";
         let header_prefix = "STATIC_RESPONSE_HEADER_";
 
@@ -44,51 +108,35 @@ impl Config {
             if let Some(stripped_key) = key.strip_prefix(replace_prefix) {
                 html_replaces.push((stripped_key.as_bytes().to_vec(), value.as_bytes().to_vec()));
             } else if let Some(stripped_key) = key.strip_prefix(header_prefix) {
-                let header_name = stripped_key.replace('_', "-");
+                let header_name = stripped_key.replace('_', "-").to_lowercase();
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::try_from(header_name),
-                    HeaderValue::try_from(value),
+                    HeaderValue::try_from(value.clone()),
                 ) {
                     response_headers.insert(name, val);
+                } else {
+                    warn!("Invalid dynamic header format: {}={}", key, value);
                 }
             }
         }
 
+        // 3. 拼装最终的 Config
         Self {
-            timeout: humantime::parse_duration(
-                &std::env::var("STATIC_TIMEOUT").unwrap_or_default(),
-            )
-            .unwrap_or(Duration::from_secs(30)),
-            compress_min_length: std::env::var("STATIC_COMPRESS_MIN_LENGTH")
-                .unwrap_or_default()
-                .parse()
-                .unwrap_or(256),
-            index_file: std::env::var("STATIC_INDEX_FILE").unwrap_or("index.html".to_string()),
-            autoindex: std::env::var("STATIC_AUTOINDEX")
-                .unwrap_or_default()
-                .parse()
-                .unwrap_or(false),
-            listen_addr: std::env::var("STATIC_LISTEN_ADDR").unwrap_or("0.0.0.0:3000".to_string()),
-            cache_control: std::env::var("STATIC_CACHE_CONTROL")
-                .unwrap_or("public, max-age=31536000, immutable".to_string()),
-            fallback_index_404: std::env::var("STATIC_FALLBACK_INDEX_404")
-                .unwrap_or_default()
-                .parse()
-                .unwrap_or(false),
-            fallback_html_404: std::env::var("STATIC_FALLBACK_HTML_404")
-                .unwrap_or_default()
-                .parse()
-                .unwrap_or(false),
+            timeout: env_cfg.timeout,
+            compress_min_length: env_cfg.compress_min_length,
+            index_file: env_cfg.index_file,
+            autoindex: env_cfg.autoindex,
+            listen_addr: env_cfg.listen_addr,
+            cache_control: env_cfg.cache_control,
+            fallback_index_404: env_cfg.fallback_index_404,
+            fallback_html_404: env_cfg.fallback_html_404,
+            cache_size: env_cfg.cache_size,
+            cache_ttl: env_cfg.cache_ttl,
+            not_modified: env_cfg.not_modified,
+            precompressed: env_cfg.precompressed,
             html_replaces: Arc::new(html_replaces),
             response_headers,
-            cache_size: std::env::var("STATIC_CACHE_SIZE")
-                .unwrap_or_default()
-                .parse()
-                .unwrap_or(1024),
-            cache_ttl: humantime::parse_duration(
-                &std::env::var("STATIC_CACHE_TTL").unwrap_or_default(),
-            )
-            .unwrap_or(Duration::from_secs(10 * 60)),
+            threads: env_cfg.threads.max(1),
         }
     }
 }

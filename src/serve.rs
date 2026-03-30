@@ -14,14 +14,14 @@
 
 use crate::error::{Error, Result};
 use crate::storage::get_storage;
-use std::sync::Arc;
 use axum::body::Body;
-use axum::http::{HeaderName, HeaderValue, header};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bstr::ByteSlice;
 use bytesize::ByteSize;
 use once_cell::sync::Lazy;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
@@ -150,6 +150,9 @@ pub struct StaticServeParams {
     pub html_replaces: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
     pub cache_size: usize,
     pub cache_ttl: Duration,
+    pub range: Option<String>,
+    pub if_none_match: Option<String>,
+    pub accept_encoding: Option<String>,
 }
 
 #[derive(Clone)]
@@ -162,6 +165,8 @@ struct FileInfoCache {
 struct FileInfo {
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Option<Vec<u8>>,
+    size: u64,
+    read_file: String,
 }
 
 static STATIC_CACHE: OnceLock<TinyUfo<String, FileInfoCache>> = OnceLock::new();
@@ -219,15 +224,19 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     if is_dir && !params.autoindex && params.index.is_empty() {
         return Err(Error::NotFound { file: file.clone() });
     }
-    let mut headers = Vec::with_capacity(4);
+    let mut headers = Vec::with_capacity(8);
+    headers.push((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")));
 
     if is_dir && params.autoindex {
         let html = get_autoindex_html(&file).await?;
         headers.push((header::CONTENT_TYPE, HeaderValue::from_static("text/html")));
         headers.push((header::CACHE_CONTROL, HeaderValue::from_static("no-cache")));
+        let body = html.into_bytes();
         let info = FileInfo {
+            size: body.len() as u64,
             headers,
-            body: Some(html.into_bytes()),
+            body: Some(body),
+            read_file: file.clone(),
         };
         if params.cache_size > 0 {
             set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
@@ -269,10 +278,31 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     if let Ok(v) = HeaderValue::try_from(content_type) {
         headers.push((header::CONTENT_TYPE, v));
     }
-    if let Some(content_encoding) = meta.content_encoding() {
-        if let Ok(v) = HeaderValue::try_from(content_encoding.to_string()) {
-            headers.push((header::CONTENT_ENCODING, v));
+    // Try pre-compressed file (.br / .gz) if enabled and client supports it
+    let mut precompressed_file = None;
+    if let Some(ref accept_encoding) = params.accept_encoding
+        && !is_html
+        && !is_dir
+    {
+        // Priority: brotli > gzip
+        let candidates: &[(&str, &str)] = &[("br", ".br"), ("gzip", ".gz")];
+        for (encoding, ext) in candidates {
+            if accept_encoding.contains(encoding) {
+                let compressed = format!("{file}{ext}");
+                if let Ok(compressed_meta) = storage.dal.stat(&compressed).await {
+                    precompressed_file = Some(compressed);
+                    meta = compressed_meta;
+                    headers.push((header::CONTENT_ENCODING, HeaderValue::from_static(encoding)));
+                    break;
+                }
+            }
         }
+    }
+    if precompressed_file.is_none()
+        && let Some(content_encoding) = meta.content_encoding()
+        && let Ok(v) = HeaderValue::try_from(content_encoding.to_string())
+    {
+        headers.push((header::CONTENT_ENCODING, v));
     }
 
     let size = meta.content_length();
@@ -289,10 +319,10 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     } else {
         None
     };
-    if let Some(etag) = etag {
-        if let Ok(v) = HeaderValue::try_from(etag) {
-            headers.push((header::ETAG, v));
-        }
+    if let Some(etag) = etag
+        && let Ok(v) = HeaderValue::try_from(etag)
+    {
+        headers.push((header::ETAG, v));
     }
 
     // size.to_string() is decimal digits — always a valid HeaderValue
@@ -302,10 +332,11 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     }
 
     // read html or small file
+    let read_file = precompressed_file.as_deref().unwrap_or(&file);
     let body = if is_html || size < 30 * 1024 {
         let mut buf = storage
             .dal
-            .read(&file)
+            .read(read_file)
             .await
             .map_err(|e| Error::Openedal { source: e })?
             .to_vec();
@@ -320,7 +351,13 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     } else {
         None
     };
-    let info = FileInfo { headers, body };
+    let read_path = precompressed_file.unwrap_or_else(|| file.clone());
+    let info = FileInfo {
+        headers,
+        body,
+        size,
+        read_file: read_path,
+    };
     if params.cache_size > 0 && !is_html && info.body.is_some() {
         set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
     }
@@ -328,29 +365,160 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     Ok(info)
 }
 
+#[derive(Clone, Copy)]
+enum RangeValue {
+    Satisfiable(u64, u64),
+    NotSatisfiable,
+}
+
+fn parse_range(range_header: &str, total_size: u64) -> Option<RangeValue> {
+    let range_str = range_header.strip_prefix("bytes=")?;
+    if range_str.contains(',') {
+        return None; // multi-range not supported
+    }
+    let (start_str, end_str) = range_str.split_once('-')?;
+
+    if total_size == 0 {
+        return Some(RangeValue::NotSatisfiable);
+    }
+
+    let (start, end) = if start_str.is_empty() {
+        // bytes=-500
+        let suffix_len: u64 = end_str.parse().ok()?;
+        if suffix_len == 0 {
+            return Some(RangeValue::NotSatisfiable);
+        }
+        if suffix_len >= total_size {
+            (0, total_size - 1)
+        } else {
+            (total_size - suffix_len, total_size - 1)
+        }
+    } else if end_str.is_empty() {
+        // bytes=500-
+        let start: u64 = start_str.parse().ok()?;
+        if start >= total_size {
+            return Some(RangeValue::NotSatisfiable);
+        }
+        (start, total_size - 1)
+    } else {
+        // bytes=500-999
+        let start: u64 = start_str.parse().ok()?;
+        let end: u64 = end_str.parse().ok()?;
+        if start > end {
+            return None; // malformed
+        }
+        if start >= total_size {
+            return Some(RangeValue::NotSatisfiable);
+        }
+        (start, end.min(total_size - 1))
+    };
+
+    Some(RangeValue::Satisfiable(start, end))
+}
+
 // 处理函数
 pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
     let file_info = get_file(&params).await?;
+    let read_file = file_info.read_file.clone();
+    let total_size = file_info
+        .body
+        .as_ref()
+        .map(|b| b.len() as u64)
+        .unwrap_or(file_info.size);
 
-    let mut resp = if let Some(body) = file_info.body {
-        body.into_response()
-    } else {
-        let r = get_storage()?
-            .dal
-            .reader(&params.file)
-            .await
-            .map_err(|e| Error::Openedal { source: e })?;
-        let stream = ReaderStream::new(
-            r.into_futures_async_read(0..)
-                .await
-                .map_err(|e| Error::Openedal { source: e })?
-                .compat(),
+    // 304 Not Modified
+    if let Some(ref if_none_match) = params.if_none_match
+        && let Some((_, etag_value)) = file_info.headers.iter().find(|(k, _)| *k == header::ETAG)
+    {
+        let etag_str = etag_value.to_str().unwrap_or_default();
+        if if_none_match == "*" || if_none_match.split(',').any(|v| v.trim() == etag_str) {
+            let mut resp = StatusCode::NOT_MODIFIED.into_response();
+            for (k, v) in file_info.headers {
+                if k == header::CONTENT_LENGTH || k == header::CONTENT_ENCODING {
+                    continue;
+                }
+                resp.headers_mut().insert(k, v);
+            }
+            return Ok(resp);
+        }
+    }
+
+    let range = params
+        .range
+        .as_deref()
+        .and_then(|r| parse_range(r, total_size));
+
+    // 416 Range Not Satisfiable
+    if matches!(range, Some(RangeValue::NotSatisfiable)) {
+        let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+        resp.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::try_from(format!("bytes */{total_size}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("bytes */*")),
         );
-        let body = Body::from_stream(stream);
-        body.into_response()
+        for (k, v) in file_info.headers {
+            if k != header::CONTENT_LENGTH {
+                resp.headers_mut().insert(k, v);
+            }
+        }
+        return Ok(resp);
+    }
+
+    let is_partial = matches!(range, Some(RangeValue::Satisfiable(_, _)));
+
+    let mut resp = if let Some(RangeValue::Satisfiable(start, end)) = range {
+        let content_length = end - start + 1;
+        let mut resp = if let Some(body) = file_info.body {
+            body[start as usize..=end as usize].to_vec().into_response()
+        } else {
+            let r = get_storage()?
+                .dal
+                .reader(&read_file)
+                .await
+                .map_err(|e| Error::Openedal { source: e })?;
+            let stream = ReaderStream::new(
+                r.into_futures_async_read(start..=end)
+                    .await
+                    .map_err(|e| Error::Openedal { source: e })?
+                    .compat(),
+            );
+            Body::from_stream(stream).into_response()
+        };
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        resp.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::try_from(format!("bytes {start}-{end}/{total_size}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("bytes */*")),
+        );
+        resp.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&content_length.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0")),
+        );
+        resp
+    } else {
+        if let Some(body) = file_info.body {
+            body.into_response()
+        } else {
+            let r = get_storage()?
+                .dal
+                .reader(&read_file)
+                .await
+                .map_err(|e| Error::Openedal { source: e })?;
+            let stream = ReaderStream::new(
+                r.into_futures_async_read(0..)
+                    .await
+                    .map_err(|e| Error::Openedal { source: e })?
+                    .compat(),
+            );
+            Body::from_stream(stream).into_response()
+        }
     };
 
     for (k, v) in file_info.headers {
+        if is_partial && k == header::CONTENT_LENGTH {
+            continue;
+        }
         resp.headers_mut().insert(k, v);
     }
 

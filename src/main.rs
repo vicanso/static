@@ -19,9 +19,9 @@ use axum::error_handling::HandleErrorLayer;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use axum::http::{Request, Uri};
+use axum::http::{HeaderMap, HeaderValue, Request, Uri, header};
 use axum::middleware::from_fn;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware::Next};
 use config::Config;
@@ -181,7 +181,11 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
 }
 
 // 处理函数
-async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> {
+async fn serve(
+    State(config): State<Arc<Config>>,
+    req_headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response> {
     let path = uri.path();
     let file = if !path.is_empty() {
         path.substring(1, path.len()).to_string()
@@ -195,6 +199,26 @@ async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> 
     };
 
     let index = config.index_file.clone();
+    let range = req_headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let if_none_match = if config.not_modified {
+        req_headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+    } else {
+        None
+    };
+    let accept_encoding = if config.precompressed {
+        req_headers
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+    } else {
+        None
+    };
     let mut last_err = Error::NotFound { file: file.clone() };
 
     for current_file in [
@@ -213,6 +237,9 @@ async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> 
             file: current_file,
             cache_size: config.cache_size,
             cache_ttl: config.cache_ttl,
+            range: range.clone(),
+            if_none_match: if_none_match.clone(),
+            accept_encoding: accept_encoding.clone(),
         })
         .await
         {
@@ -227,6 +254,24 @@ async fn serve(State(config): State<Arc<Config>>, uri: Uri) -> Result<Response> 
             }
             Err(e) => return Err(e),
         }
+    }
+    // Try serving custom error page (e.g., 404.html)
+    if last_err.is_not_found()
+        && let Ok(storage) = storage::get_storage()
+        && let Ok(buf) = storage.dal.read("404.html").await
+    {
+        let mut resp = buf.to_vec().into_response();
+        *resp.status_mut() = StatusCode::NOT_FOUND;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        for (key, value) in config.response_headers.iter() {
+            resp.headers_mut().insert(key, value.clone());
+        }
+        return Ok(resp);
     }
     Err(last_err)
 }
@@ -262,18 +307,13 @@ fn init_logger() {
 fn main() {
     init_logger();
     let config = Arc::new(Config::new());
-    let cpus = std::env::var("STATIC_THREADS")
-        .map(|v| v.parse::<usize>().unwrap_or(num_cpus::get()))
-        .unwrap_or(num_cpus::get())
-        .max(1);
     info!(
-        threads = cpus,
         config = ?config,
         "starting static server",
     );
     let _ = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(cpus)
+        .worker_threads(config.threads)
         .build()
         .unwrap_or_else(|e| panic!("failed to build tokio runtime: {}", e))
         .block_on(run(config));
