@@ -34,6 +34,8 @@ pub struct Config {
     pub cache_ttl: Duration,
     pub not_modified: bool,
     pub precompressed: bool,
+    pub access_log: bool,
+    pub read_max_size: u64,
     pub threads: usize,
 }
 
@@ -43,6 +45,16 @@ where
 {
     let s = String::deserialize(deserializer)?;
     humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_bytesize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse::<bytesize::ByteSize>()
+        .map(|b| b.0)
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Deserialize, Debug)]
@@ -62,6 +74,9 @@ struct EnvConfig {
     cache_ttl: Duration,
     not_modified: bool,
     precompressed: bool,
+    access_log: bool,
+    #[serde(deserialize_with = "deserialize_bytesize")]
+    read_max_size: u64,
     threads: usize,
 }
 
@@ -80,6 +95,8 @@ impl Default for EnvConfig {
             cache_ttl: Duration::from_secs(10 * 60),
             not_modified: false,
             precompressed: false,
+            access_log: true,
+            read_max_size: bytesize::ByteSize::kb(250).0,
             threads: num_cpus::get(),
         }
     }
@@ -98,7 +115,6 @@ impl Config {
             }
         };
 
-        // 2. 处理动态键名的配置 (Headers 和 Replaces)
         let mut html_replaces = vec![];
         let mut response_headers = HeaderMap::new();
         let replace_prefix = "STATIC_HTML_REPLACE_";
@@ -120,7 +136,6 @@ impl Config {
             }
         }
 
-        // 3. 拼装最终的 Config
         Self {
             timeout: env_cfg.timeout,
             compress_min_length: env_cfg.compress_min_length,
@@ -134,6 +149,8 @@ impl Config {
             cache_ttl: env_cfg.cache_ttl,
             not_modified: env_cfg.not_modified,
             precompressed: env_cfg.precompressed,
+            access_log: env_cfg.access_log,
+            read_max_size: env_cfg.read_max_size,
             html_replaces: Arc::new(html_replaces),
             response_headers,
             threads: env_cfg.threads.max(1),

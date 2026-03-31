@@ -34,6 +34,8 @@
 - `STATIC_NOT_MODIFIED`: 启用 `304 Not Modified` 支持，通过 `If-None-Match` / `ETag` 比对实现，默认为 `false`。
 - `STATIC_PRECOMPRESSED`: 启用预压缩文件支持，默认为 `false`。启用后，服务器会检查请求文件是否存在 `.br` 或 `.gz` 预压缩副本（如请求 `app.js` 时检查 `app.js.br`），若客户端支持对应编码则直接返回预压缩文件，跳过运行时压缩。
 - `STATIC_RESPONSE_HEADER_*`: 为所有响应添加自定义 Header，例如 `STATIC_RESPONSE_HEADER_X_FRAME_OPTIONS=DENY` 表示为每个响应添加 `x-frame-options: DENY`。
+- `STATIC_READ_MAX_SIZE`: 直接读入内存的最大文件大小，超过此值的文件将以流式传输，支持可读格式（如 `30KB`、`1MB`），默认为 `250KB`。
+- `STATIC_ACCESS_LOG`: 启用访问日志，默认为 `true`。
 - `LOG_LEVEL`: 日志级别，默认为 `INFO`，可选值为 `TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR`。
 
 

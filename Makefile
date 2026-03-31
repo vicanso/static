@@ -1,8 +1,11 @@
 dev:
-	STATIC_PATH=~/Downloads RUST_LOG=INFO cargo watch -w src -x 'run --'
+	STATIC_PATH=./assets RUST_LOG=INFO cargo watch -w src -x 'run --'
 
 fmt:
 	cargo fmt
+
+bloat:
+	cargo bloat --release 
 
 lint:
 	typos

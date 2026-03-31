@@ -2773,7 +2773,6 @@ dependencies = [
  "humantime",
  "mime_guess",
  "num_cpus",
- "once_cell",
  "opendal",
  "path-absolutize",
  "serde",

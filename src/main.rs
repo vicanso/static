@@ -81,10 +81,7 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
         .fallback(get(serve))
         .with_state(config.clone());
 
-    let builder = ServiceBuilder::new();
-    let builder = builder
-        .layer(from_fn(access_log))
-        .layer(HandleErrorLayer::new(handle_error));
+    let builder = ServiceBuilder::new().layer(HandleErrorLayer::new(handle_error));
     let size = config.compress_min_length;
     let app = if size > 0 {
         let predicate = SizeAbove::new(size).and(NotForContentType::IMAGES);
@@ -95,6 +92,11 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
         )
     } else {
         app.layer(builder.timeout(config.timeout))
+    };
+    let app = if config.access_log {
+        app.layer(from_fn(access_log))
+    } else {
+        app
     };
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
@@ -164,7 +166,8 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
         .headers()
         .get(X_ORIGINAL_SIZE_HEADER_NAME.as_str())
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(-1);
 
     info!(
         target: "access_log",
@@ -240,6 +243,7 @@ async fn serve(
             range: range.clone(),
             if_none_match: if_none_match.clone(),
             accept_encoding: accept_encoding.clone(),
+            read_max_size: config.read_max_size,
         })
         .await
         {

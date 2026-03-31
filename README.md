@@ -34,6 +34,8 @@ A high-performance static file server built with Rust and [Axum](https://github.
 - `STATIC_NOT_MODIFIED`: enable `304 Not Modified` support via `If-None-Match` / `ETag`, default is `false`
 - `STATIC_PRECOMPRESSED`: enable pre-compressed file support, default is `false`. When enabled, the server checks for `.br` or `.gz` variants of the requested file (e.g., `app.js.br` for `app.js`) and serves them directly if the client supports the encoding, skipping runtime compression
 - `STATIC_RESPONSE_HEADER_*`: add custom response headers, `STATIC_RESPONSE_HEADER_X_FRAME_OPTIONS=DENY` means add `x-frame-options: DENY` to every response
+- `STATIC_READ_MAX_SIZE`: max file size to buffer in memory, larger files are streamed, supports human-readable format (e.g., `30KB`, `1MB`), default is `250KB`
+- `STATIC_ACCESS_LOG`: enable access logging, default is `true`
 - `LOG_LEVEL`: log level, default is `INFO`, options are `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`
 
 

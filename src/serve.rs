@@ -20,7 +20,6 @@ use axum::response::{IntoResponse, Response};
 use bstr::ByteSlice;
 use bytes::Bytes;
 use bytesize::ByteSize;
-use once_cell::sync::Lazy;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,8 +29,7 @@ use tinyufo::TinyUfo;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
-pub static X_ORIGINAL_SIZE_HEADER_NAME: Lazy<HeaderName> =
-    Lazy::new(|| HeaderName::from_static("x-original-size"));
+pub static X_ORIGINAL_SIZE_HEADER_NAME: HeaderName = HeaderName::from_static("x-original-size");
 
 // Static HTML template for directory listing view
 // Includes basic styling and JavaScript for date formatting
@@ -154,6 +152,7 @@ pub struct StaticServeParams {
     pub range: Option<String>,
     pub if_none_match: Option<String>,
     pub accept_encoding: Option<String>,
+    pub read_max_size: u64,
 }
 
 #[derive(Clone)]
@@ -334,7 +333,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
 
     // read html or small file
     let read_file = precompressed_file.as_deref().unwrap_or(&file);
-    let body = if is_html || size < 30 * 1024 {
+    let body = if is_html || size < params.read_max_size {
         let mut buf = storage
             .dal
             .read(read_file)

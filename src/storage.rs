@@ -13,14 +13,16 @@
 // limitations under the License.
 
 use crate::error::Error;
-use once_cell::sync::OnceCell;
 use opendal::{Builder, Operator, layers::MimeGuessLayer};
 use path_absolutize::Absolutize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use tracing::info;
 use url::Url;
 
 type Result<T> = std::result::Result<T, Error>;
+static STORAGE: OnceLock<Storage> = OnceLock::new();
 
 pub struct Storage {
     pub dal: Operator,
@@ -44,8 +46,6 @@ impl Storage {
         Ok(())
     }
 }
-
-static STORAGE: OnceCell<Storage> = OnceCell::new();
 
 struct StorageParams {
     user: String,
@@ -106,6 +106,11 @@ fn new_s3_dal(url: &str) -> Result<Storage> {
         builder = builder.secret_access_key(secret_access_key);
     }
 
+    info!(
+        category = "s3",
+        endpoint = params.endpoint,
+        "initialize storage"
+    );
     Ok(Storage {
         dal: build_operator(builder)?,
         root: None,
@@ -124,6 +129,11 @@ fn new_ftp_dal(url: &str) -> Result<Storage> {
     if let Some(password) = params.password {
         builder = builder.password(&password);
     }
+    info!(
+        category = "ftp",
+        endpoint = params.endpoint,
+        "initialize storage"
+    );
     Ok(Storage {
         dal: build_operator(builder)?,
         root: None,
@@ -132,6 +142,7 @@ fn new_ftp_dal(url: &str) -> Result<Storage> {
 
 fn new_gridfs_dal(url: &str) -> Result<Storage> {
     let builder = opendal::services::Gridfs::default().connection_string(url);
+    info!(category = "gridfs", "initialize storage");
     Ok(Storage {
         dal: build_operator(builder)?,
         root: None,
@@ -139,7 +150,10 @@ fn new_gridfs_dal(url: &str) -> Result<Storage> {
 }
 
 pub fn get_storage() -> Result<&'static Storage> {
-    STORAGE.get_or_try_init(|| {
+    if let Some(storage) = STORAGE.get() {
+        return Ok(storage);
+    }
+    let storage = {
         let static_path = std::env::var("STATIC_PATH").unwrap_or_else(|_| "/static".to_string());
 
         match static_path {
@@ -151,16 +165,22 @@ pub fn get_storage() -> Result<&'static Storage> {
             static_path if static_path.starts_with("ftp://") => new_ftp_dal(&static_path),
             static_path if static_path.starts_with("mongodb://") => new_gridfs_dal(&static_path),
             _ => {
-                let opendal = opendal::services::Fs::default().root(static_path.as_str());
+                let abs_path = PathBuf::from(&static_path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&static_path));
+                let opendal = opendal::services::Fs::default()
+                    .root(abs_path.to_str().unwrap_or(&static_path));
+                info!(category = "fs", path = %abs_path.to_string_lossy(), "initialize storage");
                 let dal = opendal::Operator::new(opendal)
                     .map_err(|e| Error::Openedal { source: e })?
                     .layer(MimeGuessLayer::default())
                     .finish();
                 Ok(Storage {
                     dal,
-                    root: Some(PathBuf::from(static_path)),
+                    root: Some(abs_path),
                 })
             }
         }
-    })
+    }?;
+    Ok(STORAGE.get_or_init(|| storage))
 }
