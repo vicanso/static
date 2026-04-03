@@ -1,4 +1,4 @@
-// Copyright 2025 Tree xie.
+// Copyright 2025-2026 Tree xie.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ use axum::response::{IntoResponse, Response};
 use bstr::ByteSlice;
 use bytes::Bytes;
 use bytesize::ByteSize;
+use httpdate::{fmt_http_date, parse_http_date};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -146,11 +148,13 @@ pub struct StaticServeParams {
     pub index: String,
     pub autoindex: bool,
     pub cache_control: String,
+    pub cache_control_map: Arc<HashMap<String, String>>,
     pub html_replaces: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
     pub cache_size: usize,
     pub cache_ttl: Duration,
     pub range: Option<String>,
     pub if_none_match: Option<String>,
+    pub if_modified_since: Option<String>,
     pub accept_encoding: Option<String>,
     pub read_max_size: u64,
 }
@@ -167,6 +171,7 @@ struct FileInfo {
     body: Option<Bytes>,
     size: u64,
     read_file: String,
+    last_modified_secs: Option<i64>,
 }
 
 static STATIC_CACHE: OnceLock<TinyUfo<String, FileInfoCache>> = OnceLock::new();
@@ -237,6 +242,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             headers,
             body: Some(body),
             read_file: file.clone(),
+            last_modified_secs: None,
         };
         if params.cache_size > 0 {
             set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
@@ -264,13 +270,24 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
                 .to_string()
         });
     let mut is_html = false;
-    let cache_control = if content_type.contains("text/html") {
+    let cache_control: String = if content_type.contains("text/html") {
         is_html = true;
-        "no-cache"
-    } else if let Some(cache_control) = meta.cache_control() {
-        cache_control
+        "no-cache".to_string()
+    } else if let Some(cc) = meta.cache_control() {
+        cc.to_string()
     } else {
-        &params.cache_control
+        // Check per-extension override before falling back to global default
+        let ext = Path::new(&file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        if let Some(ext) = ext
+            && let Some(cc) = params.cache_control_map.get(&ext)
+        {
+            cc.clone()
+        } else {
+            params.cache_control.clone()
+        }
     };
     if let Ok(v) = HeaderValue::try_from(cache_control) {
         headers.push((header::CACHE_CONTROL, v));
@@ -304,25 +321,34 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     {
         headers.push((header::CONTENT_ENCODING, v));
     }
+    // Add Vary: Accept-Encoding when precompressed feature is enabled so CDN
+    // caches compressed and uncompressed variants separately
+    if params.accept_encoding.is_some() && !is_html && !is_dir {
+        headers.push((header::VARY, HeaderValue::from_static("Accept-Encoding")));
+    }
 
     let size = meta.content_length();
-    // Generate ETag based on file size and modification time
+    // Extract last_modified once so it can be used for both ETag and Last-Modified header
+    let last_modified_ms = meta
+        .last_modified()
+        .map(|lm| lm.into_inner().as_millisecond())
+        .filter(|&ms| ms > 0);
     let etag = if let Some(etag) = meta.etag() {
         Some(etag.to_string())
-    } else if let Some(last_modified) = meta.last_modified() {
-        let value = last_modified.into_inner().as_millisecond();
-        if value > 0 {
-            Some(format!(r#"W/"{size:x}-{value:x}""#))
-        } else {
-            None
-        }
     } else {
-        None
+        last_modified_ms.map(|ms| format!(r#"W/"{size:x}-{ms:x}""#))
     };
     if let Some(etag) = etag
         && let Ok(v) = HeaderValue::try_from(etag)
     {
         headers.push((header::ETAG, v));
+    }
+    let last_modified_secs = last_modified_ms.map(|ms| ms / 1000);
+    if let Some(secs) = last_modified_secs {
+        let sys_time = UNIX_EPOCH + Duration::from_secs(secs as u64);
+        if let Ok(v) = HeaderValue::try_from(fmt_http_date(sys_time)) {
+            headers.push((header::LAST_MODIFIED, v));
+        }
     }
 
     // size.to_string() is decimal digits — always a valid HeaderValue
@@ -357,6 +383,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         body,
         size,
         read_file: read_path,
+        last_modified_secs,
     };
     if params.cache_size > 0 && !is_html && info.body.is_some() {
         set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
@@ -440,6 +467,25 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
             );
             return Ok(resp);
         }
+    }
+
+    // 304 Not Modified (If-Modified-Since)
+    if let Some(ref ims) = params.if_modified_since
+        && let Some(secs) = file_info.last_modified_secs
+        && let Ok(ims_time) = parse_http_date(ims)
+        && let Ok(ims_secs) = ims_time
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+        && secs <= ims_secs
+    {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        resp.headers_mut().extend(
+            file_info
+                .headers
+                .into_iter()
+                .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING),
+        );
+        return Ok(resp);
     }
 
     let range = params

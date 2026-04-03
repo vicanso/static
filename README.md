@@ -26,6 +26,7 @@ A high-performance static file server built with Rust and [Axum](https://github.
 - `STATIC_INDEX_FILE`: index file, default is `index.html`
 - `STATIC_AUTOINDEX`: autoindex, default is `false`
 - `STATIC_CACHE_CONTROL`: cache control, default is `public, max-age=31536000, immutable`, and html will be `no-cache`
+- `STATIC_CACHE_CONTROL_EXT_*`: per-extension cache control override. `STATIC_CACHE_CONTROL_EXT_WASM=no-cache` sets `Cache-Control: no-cache` for `.wasm` files. Takes precedence over `STATIC_CACHE_CONTROL` but not over html's `no-cache`
 - `STATIC_CACHE_SIZE`: cache size, default is `1024`
 - `STATIC_CACHE_TTL`: cache ttl, default is `10m`, html files will not be cached
 - `STATIC_HTML_REPLACE_*`: replace html content, `STATIC_HTML_REPLACE_{{HOST}}=https://test.com` means replace `{{HOST}}` to `https://test.com`
@@ -33,10 +34,105 @@ A high-performance static file server built with Rust and [Axum](https://github.
 - `STATIC_FALLBACK_HTML_404`: use `.html` for 404 not found route
 - `STATIC_NOT_MODIFIED`: enable `304 Not Modified` support via `If-None-Match` / `ETag`, default is `false`
 - `STATIC_PRECOMPRESSED`: enable pre-compressed file support, default is `false`. When enabled, the server checks for `.br` or `.gz` variants of the requested file (e.g., `app.js.br` for `app.js`) and serves them directly if the client supports the encoding, skipping runtime compression
+- `STATIC_BASIC_AUTH_*`: configure Basic Auth credentials. Format: `STATIC_BASIC_AUTH_<NAME>=username:password`. Multiple accounts are supported by using different `<NAME>` suffixes. When any credential is set, unauthenticated requests receive a `401` response with a `WWW-Authenticate` header
+- `STATIC_BASIC_AUTH_REALM`: the realm string in the `WWW-Authenticate` header, default is `static`
+- `STATIC_IP_ALLOWLIST`: comma-separated list of allowed IPs or CIDR blocks (e.g. `192.168.0.0/16,127.0.0.1`). When set, requests from IPs not in the list are rejected with 403. The `/health` endpoint is not affected
+- `STATIC_IP_BLOCKLIST`: comma-separated list of blocked IPs or CIDR blocks (e.g. `1.2.3.4,10.0.0.0/8`). Requests from matching IPs are rejected with 403. Checked before the allowlist. The `/health` endpoint is not affected
+- `STATIC_REDIRECT_*`: configure redirect rules. Format: `STATIC_REDIRECT_<NAME>=<source> <target>` (default 301) or `STATIC_REDIRECT_<NAME>=<source> <status_code> <target>`. The `<NAME>` is an arbitrary identifier to allow multiple rules
 - `STATIC_RESPONSE_HEADER_*`: add custom response headers, `STATIC_RESPONSE_HEADER_X_FRAME_OPTIONS=DENY` means add `x-frame-options: DENY` to every response
 - `STATIC_READ_MAX_SIZE`: max file size to buffer in memory, larger files are streamed, supports human-readable format (e.g., `30KB`, `1MB`), default is `250KB`
 - `STATIC_ACCESS_LOG`: enable access logging, default is `true`
 - `LOG_LEVEL`: log level, default is `INFO`, options are `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`
+
+
+## Basic Authentication
+
+Protect the server with HTTP Basic Auth by setting one or more `STATIC_BASIC_AUTH_*` environment variables. The `<NAME>` suffix is an arbitrary label to distinguish multiple accounts.
+
+```bash
+# Single account
+STATIC_BASIC_AUTH_ADMIN=admin:secret
+
+# Multiple accounts
+STATIC_BASIC_AUTH_ALICE=alice:pass1
+STATIC_BASIC_AUTH_BOB=bob:pass2
+
+# Custom realm shown in browser login dialog (default: "static")
+STATIC_BASIC_AUTH_REALM=My Internal Tool
+```
+
+The `/health` endpoint bypasses Basic Auth so load balancers can always reach it.
+
+
+## IP Access Control
+
+Restrict access by client IP using allowlists and blocklists. Both support individual IPs and CIDR notation, and both IPv4 and IPv6 are supported. The client IP is resolved from `X-Forwarded-For`, then `X-Real-IP`, then the connection address.
+
+```bash
+# Block specific IPs and ranges
+STATIC_IP_BLOCKLIST=1.2.3.4,10.0.0.0/8
+
+# Only allow internal network access
+STATIC_IP_ALLOWLIST=192.168.0.0/16,127.0.0.1
+
+# Both can be set simultaneously — blocklist is checked first
+STATIC_IP_BLOCKLIST=1.2.3.4
+STATIC_IP_ALLOWLIST=192.168.0.0/16
+```
+
+The `/health` endpoint bypasses IP access control so load balancers can always reach it.
+
+
+## Redirect Rules
+
+Configure URL redirects via `STATIC_REDIRECT_*` environment variables. The `<NAME>` suffix is an arbitrary label used to distinguish multiple rules.
+
+**Default 301 (permanent redirect):**
+```bash
+STATIC_REDIRECT_HOME=/home /index.html
+STATIC_REDIRECT_OLD_DOCS=/docs /v2/docs
+```
+
+**Explicit status code:**
+```bash
+# 302 temporary redirect
+STATIC_REDIRECT_API=/api 302 https://api.example.com
+
+# 301 to an external URL
+STATIC_REDIRECT_LEGACY=/old-product 301 https://example.com/new-product
+```
+
+Format: `STATIC_REDIRECT_<NAME>=<source_path> [status_code] <target>`
+
+- `source_path` — exact path to match (e.g. `/old/page`)
+- `status_code` — optional HTTP status code, defaults to `301`
+- `target` — redirect destination, can be a path or a full URL
+
+Redirects are checked before any file serving, and custom response headers (`STATIC_RESPONSE_HEADER_*`) are also applied to redirect responses.
+
+
+## Per-Extension Cache Control
+
+By default all non-HTML files use `STATIC_CACHE_CONTROL`. Use `STATIC_CACHE_CONTROL_EXT_*` to override this per file extension. The extension (without the dot) is the suffix of the environment variable name, case-insensitive.
+
+```bash
+# Disable caching for WebAssembly (frequently updated in development)
+STATIC_CACHE_CONTROL_EXT_WASM=no-cache
+
+# Cache fonts for one year without immutable (allows re-validation)
+STATIC_CACHE_CONTROL_EXT_WOFF2=public, max-age=31536000
+STATIC_CACHE_CONTROL_EXT_WOFF=public, max-age=31536000
+
+# Short cache for JSON data files
+STATIC_CACHE_CONTROL_EXT_JSON=public, max-age=300
+```
+
+Priority (highest to lowest):
+
+1. HTML files — always `no-cache`
+2. Cache-Control returned by the storage backend
+3. `STATIC_CACHE_CONTROL_EXT_<EXT>` — per-extension override
+4. `STATIC_CACHE_CONTROL` — global default
 
 
 ## Custom Error Pages

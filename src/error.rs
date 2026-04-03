@@ -1,4 +1,4 @@
-// Copyright 2025 Tree xie.
+// Copyright 2025-2026 Tree xie.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +32,10 @@ pub enum Error {
     #[snafu(display("File not found: {file}"))]
     NotFound { file: String },
 
-    #[snafu(display("OpenDAL error: {source}"))]
+    #[snafu(display("Forbidden"))]
+    Forbidden,
+
+    #[snafu(display("Opendal error: {source}"))]
     #[snafu(context(false))]
     Openedal { source: opendal::Error },
 
@@ -61,6 +64,7 @@ impl IntoResponse for Error {
             match self {
                 Error::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
                 Error::Timeout => StatusCode::REQUEST_TIMEOUT,
+                Error::Forbidden => StatusCode::FORBIDDEN,
                 _ => StatusCode::BAD_REQUEST,
             }
         };

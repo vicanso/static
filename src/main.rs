@@ -1,4 +1,4 @@
-// Copyright 2025 Tree xie.
+// Copyright 2025-2026 Tree xie.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use crate::error::{Error, Result, handle_error};
 use crate::serve::X_ORIGINAL_SIZE_HEADER_NAME;
 use axum::body::Body;
@@ -186,10 +188,59 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
 // 处理函数
 async fn serve(
     State(config): State<Arc<Config>>,
+    ClientIp(ip): ClientIp,
     req_headers: HeaderMap,
     uri: Uri,
 ) -> Result<Response> {
     let path = uri.path();
+
+    // IP access control: blocklist takes priority, then allowlist
+    if !config.ip_blocklist.is_empty() && config.ip_blocklist.iter().any(|net| net.contains(&ip)) {
+        return Err(Error::Forbidden);
+    }
+    if !config.ip_allowlist.is_empty() && !config.ip_allowlist.iter().any(|net| net.contains(&ip)) {
+        return Err(Error::Forbidden);
+    }
+
+    // Basic Auth
+    if !config.basic_auth.is_empty() {
+        let authorized = req_headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(|b64| BASE64_STANDARD.decode(b64.trim()).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|creds| config.basic_auth.contains(&creds));
+
+        if !authorized {
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = StatusCode::UNAUTHORIZED;
+            if let Ok(v) = HeaderValue::try_from(
+                format!("Basic realm=\"{}\"", config.basic_auth_realm),
+            ) {
+                resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+            }
+            return Ok(resp);
+        }
+    }
+
+    // Check redirect rules before any file serving
+    for (from, status, to) in config.redirects.iter() {
+        if path == from.as_str() {
+            let status_code =
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = status_code;
+            if let Ok(location) = HeaderValue::try_from(to.as_str()) {
+                resp.headers_mut().insert(header::LOCATION, location);
+            }
+            for (key, value) in config.response_headers.iter() {
+                resp.headers_mut().insert(key, value.clone());
+            }
+            return Ok(resp);
+        }
+    }
+
     let file = if !path.is_empty() {
         path.substring(1, path.len()).to_string()
     } else {
@@ -209,6 +260,14 @@ async fn serve(
     let if_none_match = if config.not_modified {
         req_headers
             .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+    } else {
+        None
+    };
+    let if_modified_since = if config.not_modified {
+        req_headers
+            .get(header::IF_MODIFIED_SINCE)
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string())
     } else {
@@ -236,12 +295,14 @@ async fn serve(
             index: index.clone(),
             autoindex: config.autoindex,
             cache_control: config.cache_control.clone(),
+            cache_control_map: config.cache_control_map.clone(),
             html_replaces: config.html_replaces.clone(),
             file: current_file,
             cache_size: config.cache_size,
             cache_ttl: config.cache_ttl,
             range: range.clone(),
             if_none_match: if_none_match.clone(),
+            if_modified_since: if_modified_since.clone(),
             accept_encoding: accept_encoding.clone(),
             read_max_size: config.read_max_size,
         })
