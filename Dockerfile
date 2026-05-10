@@ -11,13 +11,15 @@ RUN curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/htt
 RUN cd /static \
     && make release
 
-FROM ubuntu:24.04
+FROM debian:bookworm-slim
 
-EXPOSE 3000 
+EXPOSE 3000
 
-COPY --from=builder /static/target/release/static-serve /usr/local/bin/static-serve
-COPY --from=builder /static/entrypoint.sh /entrypoint.sh
-COPY --from=builder /usr/local/bin/httpstat /usr/local/bin/httpstat
+RUN useradd -r -s /bin/false ubuntu
+
+COPY --from=builder --chown=ubuntu:ubuntu /static/target/release/static-serve /usr/local/bin/static-serve
+COPY --from=builder --chown=ubuntu:ubuntu /static/entrypoint.sh /entrypoint.sh
+COPY --from=builder --chown=ubuntu:ubuntu /usr/local/bin/httpstat /usr/local/bin/httpstat
 
 
 USER ubuntu
