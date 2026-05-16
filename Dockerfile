@@ -1,4 +1,4 @@
-FROM rust:1.94.1 as builder
+FROM rust:1.95.0 as builder
 
 COPY . /static
 
@@ -17,9 +17,9 @@ EXPOSE 3000
 
 RUN useradd -r -s /bin/false ubuntu
 
-COPY --from=builder --chown=ubuntu:ubuntu /static/target/release/static-serve /usr/local/bin/static-serve
-COPY --from=builder --chown=ubuntu:ubuntu /static/entrypoint.sh /entrypoint.sh
-COPY --from=builder --chown=ubuntu:ubuntu /usr/local/bin/httpstat /usr/local/bin/httpstat
+COPY --from=builder --chown=ubuntu:ubuntu --chmod=755 /static/target/release/static-serve /usr/local/bin/static-serve
+COPY --from=builder --chown=ubuntu:ubuntu --chmod=755 /static/entrypoint.sh /entrypoint.sh
+COPY --from=builder --chown=ubuntu:ubuntu --chmod=755 /usr/local/bin/httpstat /usr/local/bin/httpstat
 
 
 USER ubuntu

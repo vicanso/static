@@ -1,5 +1,7 @@
 # static
 
+**English** | [中文](./README_zh.md)
+
 A high-performance static file server built with Rust and [Axum](https://github.com/tokio-rs/axum). It uses [Apache OpenDAL](https://github.com/apache/opendal) as a unified storage abstraction layer, enabling seamless access to multiple storage backends through a single consistent API — no need to switch libraries or rewrite code when changing backends. Supported backends include local filesystem, Amazon S3 (and S3-compatible services), FTP, and MongoDB GridFS.
 
 ## Features

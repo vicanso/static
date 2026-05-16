@@ -1,5 +1,7 @@
 # static
 
+[English](./README.md) | **中文**
+
 基于 Rust 和 [Axum](https://github.com/tokio-rs/axum) 构建的高性能静态文件服务器。通过 [Apache OpenDAL](https://github.com/apache/opendal) 统一存储抽象层，使用一套一致的 API 无缝对接多种存储后端——切换后端无需更换库或重写代码。支持本地文件系统、Amazon S3（及 S3 兼容服务）、FTP 和 MongoDB GridFS。
 
 ## 特性
