@@ -38,6 +38,7 @@ pub struct Config {
     pub ip_blocklist: Arc<Vec<IpNet>>,
     pub basic_auth: Arc<HashSet<String>>,
     pub basic_auth_realm: String,
+    pub error_page: Option<String>,
     pub response_headers: HeaderMap,
     pub cache_size: usize,
     pub cache_ttl: Duration,
@@ -96,6 +97,7 @@ struct EnvConfig {
     ip_allowlist: String,
     ip_blocklist: String,
     basic_auth_realm: String,
+    error_page: Option<String>,
 }
 
 impl Default for EnvConfig {
@@ -119,6 +121,7 @@ impl Default for EnvConfig {
             ip_allowlist: String::new(),
             ip_blocklist: String::new(),
             basic_auth_realm: "static".to_string(),
+            error_page: None,
         }
     }
 }
@@ -229,6 +232,7 @@ impl Config {
             ip_blocklist: Arc::new(parse_ip_list(&env_cfg.ip_blocklist)),
             basic_auth: Arc::new(basic_auth),
             basic_auth_realm: env_cfg.basic_auth_realm,
+            error_page: env_cfg.error_page,
             response_headers,
             threads: env_cfg.threads.max(1),
         }

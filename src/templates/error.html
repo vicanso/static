@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{{STATUS}} {{REASON}}</title>
+<style>
+    :root {
+        --bg: #0d1117;
+        --cell-off: #161b22;
+        --cell-border: rgba(240, 246, 252, 0.06);
+        --text: #c9d1d9;
+        --muted: #6e7681;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 32px;
+        background: var(--bg);
+        color: var(--text);
+        font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    .digits { display: flex; gap: 22px; }
+    .digit {
+        --s: 18px;
+        --g: 5px;
+        display: grid;
+        grid-template-columns: repeat(3, var(--s));
+        grid-auto-rows: var(--s);
+        gap: var(--g);
+    }
+    .cell {
+        width: var(--s);
+        height: var(--s);
+        border-radius: 3px;
+        background: var(--cell-off);
+        box-shadow: inset 0 0 0 1px var(--cell-border);
+    }
+    .reason {
+        margin-top: 34px;
+        font-size: 15px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--muted);
+    }
+    .legend {
+        margin-top: 18px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: var(--muted);
+    }
+    .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+    @media (max-width: 480px) {
+        .digits { gap: 14px; }
+        .digit { --s: 12px; --g: 4px; }
+    }
+</style>
+</head>
+<body>
+    <div id="grid" class="digits" data-code="{{STATUS}}">{{STATUS}}</div>
+    <div class="reason">{{REASON}}</div>
+    <div class="legend">
+        <span>low</span>
+        <i style="background:#f0883e"></i>
+        <i style="background:#f85149"></i>
+        <i style="background:#da3633"></i>
+        <i style="background:#b62324"></i>
+        <span>risk</span>
+    </div>
+    <script>
+    (function () {
+        var FONT = {
+            "0": ["111", "101", "101", "101", "111"],
+            "1": ["010", "110", "010", "010", "111"],
+            "2": ["111", "001", "111", "100", "111"],
+            "3": ["111", "001", "111", "001", "111"],
+            "4": ["101", "101", "111", "001", "001"],
+            "5": ["111", "100", "111", "001", "111"],
+            "6": ["111", "100", "111", "101", "111"],
+            "7": ["111", "001", "010", "100", "100"],
+            "8": ["111", "101", "111", "101", "111"],
+            "9": ["111", "101", "111", "001", "111"],
+            "x": ["101", "101", "010", "101", "101"],
+            "X": ["101", "101", "010", "101", "101"]
+        };
+        var RISK = ["#f0883e", "#f85149", "#da3633", "#b62324"];
+        var grid = document.getElementById("grid");
+        var code = (grid.getAttribute("data-code") || "").trim();
+        if (!code || !/^[0-9xX]+$/.test(code)) return; // keep plain-text fallback
+        grid.textContent = "";
+        for (var i = 0; i < code.length; i++) {
+            var glyph = FONT[code[i]];
+            var digit = document.createElement("div");
+            digit.className = "digit";
+            if (glyph) {
+                for (var r = 0; r < 5; r++) {
+                    for (var c = 0; c < 3; c++) {
+                        var cell = document.createElement("span");
+                        cell.className = "cell";
+                        if (glyph[r][c] === "1") {
+                            cell.style.background = RISK[Math.floor(Math.random() * RISK.length)];
+                        }
+                        digit.appendChild(cell);
+                    }
+                }
+            }
+            grid.appendChild(digit);
+        }
+    })();
+    </script>
+</body>
+</html>

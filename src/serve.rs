@@ -35,75 +35,7 @@ pub static X_ORIGINAL_SIZE_HEADER_NAME: HeaderName = HeaderName::from_static("x-
 
 // Static HTML template for directory listing view
 // Includes basic styling and JavaScript for date formatting
-static WEB_HTML: &str = r###"<!doctype html>
-<html lang="en">
-    <head>
-        <meta charset="utf-8" />
-        <style>
-            * {
-                margin: 0;
-                padding: 0;
-            }
-            table {
-                width: 100%;
-            }
-            a {
-                color: #333;
-            }
-            .size {
-                width: 180px;
-                text-align: left;
-            }
-            .lastModified {
-                width: 280px;
-                text-align: right;
-            }
-            th, td {
-                padding: 10px;
-            }
-            thead {
-                background-color: #f0f0f0;
-            }
-            tr:nth-child(even) {
-                background-color: #f0f0f0;
-            }
-        </style>
-        <script type="text/javascript">
-        function updateAllLastModified() {
-            Array.from(document.getElementsByClassName("lastModified")).forEach((item, index) => {
-                if (index == 0) {
-                    return;
-                }
-                const ts = item.innerHTML;
-                if (!ts) {
-                    item.innerHTML = "--";
-                    return;
-                }
-                const date = new Date(ts * 1000);
-                if (isFinite(date)) {
-                    item.innerHTML = date.toLocaleString();
-                }
-            });
-        }
-        document.addEventListener("DOMContentLoaded", (event) => {
-          updateAllLastModified();
-        });
-        </script>
-    </head>
-    <body>
-        <table border="0" cellpadding="0" cellspacing="0">
-            <thead>
-                <th class="name">File Name</th>
-                <th class="size">Size</th>
-                <th class="lastModified">Last Modified</th>
-            </thread>
-            <tbody>
-                {{CONTENT}}
-            </tobdy>
-        </table>
-    </body>
-</html>
-"###;
+static WEB_HTML: &str = include_str!("templates/autoindex.html");
 
 async fn get_autoindex_html(path: &str) -> Result<String> {
     let entry_list = get_storage()?

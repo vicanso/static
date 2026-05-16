@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use crate::error::{Error, Result, handle_error};
+use crate::error::{Error, Result, handle_error, init_error_template};
 use crate::serve::X_ORIGINAL_SIZE_HEADER_NAME;
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
@@ -26,6 +24,8 @@ use axum::middleware::from_fn;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware::Next};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use config::Config;
 use serve::{StaticServeParams, static_serve};
 use std::net::{IpAddr, SocketAddr};
@@ -215,9 +215,9 @@ async fn serve(
         if !authorized {
             let mut resp = Response::new(Body::empty());
             *resp.status_mut() = StatusCode::UNAUTHORIZED;
-            if let Ok(v) = HeaderValue::try_from(
-                format!("Basic realm=\"{}\"", config.basic_auth_realm),
-            ) {
+            if let Ok(v) =
+                HeaderValue::try_from(format!("Basic realm=\"{}\"", config.basic_auth_realm))
+            {
                 resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
             }
             return Ok(resp);
@@ -372,6 +372,7 @@ fn init_logger() {
 fn main() {
     init_logger();
     let config = Arc::new(Config::new());
+    init_error_template(config.error_page.as_deref());
     info!(
         config = ?config,
         "starting static server",

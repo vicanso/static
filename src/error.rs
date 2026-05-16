@@ -16,6 +16,7 @@ use axum::BoxError;
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use snafu::Snafu;
+use std::sync::OnceLock;
 use tracing::{error, warn};
 
 #[derive(Debug, Snafu)]
@@ -56,9 +57,38 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+// Built-in error page, rendered for every error response so clients never
+// see raw opendal / internal detail (that is logged server-side instead).
+const DEFAULT_ERROR_HTML: &str = include_str!("templates/error.html");
+
+static ERROR_TEMPLATE: OnceLock<String> = OnceLock::new();
+
+/// Resolve the error page once at startup. When `path` is `Some`, the file
+/// must be readable; otherwise the process exits — consistent with strict
+/// config loading (never serve with a misconfigured custom page silently).
+/// When `path` is `None`, the built-in template is used.
+pub fn init_error_template(path: Option<&str>) {
+    let html = match path {
+        Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| {
+            error!("Failed to read STATIC_ERROR_PAGE={p}: {e}");
+            std::process::exit(1)
+        }),
+        None => DEFAULT_ERROR_HTML.to_string(),
+    };
+    let _ = ERROR_TEMPLATE.set(html);
+}
+
+fn error_template() -> &'static str {
+    ERROR_TEMPLATE
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_ERROR_HTML)
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let status = if self.is_not_found() {
+        let is_not_found = self.is_not_found();
+        let status = if is_not_found {
             StatusCode::NOT_FOUND
         } else {
             match self {
@@ -69,10 +99,32 @@ impl IntoResponse for Error {
             }
         };
 
+        // Log internal detail server-side; the response body stays generic.
+        match &self {
+            Error::Openedal { source } if !is_not_found => {
+                error!(error = %source, status = status.as_u16(), "opendal error");
+            }
+            Error::InvalidFile { message } => {
+                warn!(detail = %message, "invalid file request");
+            }
+            Error::Unknown => {
+                error!(status = status.as_u16(), "internal error");
+            }
+            _ => {}
+        }
+
+        let reason = status.canonical_reason().unwrap_or("Error");
+        let body = error_template()
+            .replace("{{STATUS}}", status.as_str())
+            .replace("{{REASON}}", reason);
+
         (
             status,
-            [(header::CACHE_CONTROL, "no-cache")],
-            self.to_string(),
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            body,
         )
             .into_response()
     }
