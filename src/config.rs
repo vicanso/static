@@ -48,29 +48,37 @@ pub struct Config {
     pub threads: usize,
 }
 
-fn deserialize_humantime<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+// Parse an optional humantime duration from env. Absent -> default;
+// present but invalid -> log and exit (never run with a misread config).
+fn parse_duration_or_exit(name: &str, raw: Option<&str>, default: Duration) -> Duration {
+    match raw {
+        None => default,
+        Some(s) => humantime::parse_duration(s).unwrap_or_else(|e| {
+            error!("Invalid {name}={s}: {e}");
+            std::process::exit(1)
+        }),
+    }
 }
 
-fn deserialize_bytesize<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    s.parse::<bytesize::ByteSize>()
-        .map(|b| b.0)
-        .map_err(serde::de::Error::custom)
+// Parse an optional byte size from env. Absent -> default;
+// present but invalid -> log and exit.
+fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
+    match raw {
+        None => default,
+        Some(s) => s
+            .parse::<bytesize::ByteSize>()
+            .map(|b| b.0)
+            .unwrap_or_else(|e| {
+                error!("Invalid {name}={s}: {e}");
+                std::process::exit(1)
+            }),
+    }
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(default)]
 struct EnvConfig {
-    #[serde(deserialize_with = "deserialize_humantime")]
-    timeout: Duration,
+    timeout: Option<String>,
     compress_min_length: u16,
     index_file: String,
     autoindex: bool,
@@ -79,13 +87,11 @@ struct EnvConfig {
     fallback_index_404: bool,
     fallback_html_404: bool,
     cache_size: usize,
-    #[serde(deserialize_with = "deserialize_humantime")]
-    cache_ttl: Duration,
+    cache_ttl: Option<String>,
     not_modified: bool,
     precompressed: bool,
     access_log: bool,
-    #[serde(deserialize_with = "deserialize_bytesize")]
-    read_max_size: u64,
+    read_max_size: Option<String>,
     threads: usize,
     ip_allowlist: String,
     ip_blocklist: String,
@@ -95,7 +101,7 @@ struct EnvConfig {
 impl Default for EnvConfig {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: None,
             compress_min_length: 256,
             index_file: "index.html".to_string(),
             autoindex: false,
@@ -104,11 +110,11 @@ impl Default for EnvConfig {
             fallback_index_404: false,
             fallback_html_404: false,
             cache_size: 1024,
-            cache_ttl: Duration::from_secs(10 * 60),
+            cache_ttl: None,
             not_modified: false,
             precompressed: false,
             access_log: true,
-            read_max_size: bytesize::ByteSize::kb(250).0,
+            read_max_size: None,
             threads: num_cpus::get(),
             ip_allowlist: String::new(),
             ip_blocklist: String::new(),
@@ -136,11 +142,8 @@ impl Config {
         let env_cfg = match envy::prefixed("STATIC_").from_env::<EnvConfig>() {
             Ok(cfg) => cfg,
             Err(e) => {
-                error!(
-                    "Failed to parse static configs from env: {}. Using defaults.",
-                    e
-                );
-                EnvConfig::default()
+                error!("Failed to parse static configs from env: {e}");
+                std::process::exit(1)
             }
         };
 
@@ -193,7 +196,11 @@ impl Config {
         }
 
         Self {
-            timeout: env_cfg.timeout,
+            timeout: parse_duration_or_exit(
+                "STATIC_TIMEOUT",
+                env_cfg.timeout.as_deref(),
+                Duration::from_secs(30),
+            ),
             compress_min_length: env_cfg.compress_min_length,
             index_file: env_cfg.index_file,
             autoindex: env_cfg.autoindex,
@@ -202,11 +209,19 @@ impl Config {
             fallback_index_404: env_cfg.fallback_index_404,
             fallback_html_404: env_cfg.fallback_html_404,
             cache_size: env_cfg.cache_size,
-            cache_ttl: env_cfg.cache_ttl,
+            cache_ttl: parse_duration_or_exit(
+                "STATIC_CACHE_TTL",
+                env_cfg.cache_ttl.as_deref(),
+                Duration::from_secs(10 * 60),
+            ),
             not_modified: env_cfg.not_modified,
             precompressed: env_cfg.precompressed,
             access_log: env_cfg.access_log,
-            read_max_size: env_cfg.read_max_size,
+            read_max_size: parse_bytesize_or_exit(
+                "STATIC_READ_MAX_SIZE",
+                env_cfg.read_max_size.as_deref(),
+                bytesize::ByteSize::kb(250).0,
+            ),
             html_replaces: Arc::new(html_replaces),
             cache_control_map: Arc::new(cache_control_map),
             redirects: Arc::new(redirects),
