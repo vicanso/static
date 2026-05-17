@@ -2773,6 +2773,7 @@ dependencies = [
  "bytes",
  "bytesize",
  "envy",
+ "http-body",
  "httpdate",
  "humantime",
  "ipnet",

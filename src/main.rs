@@ -19,7 +19,7 @@ use axum::error_handling::HandleErrorLayer;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, Request, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, Uri, header};
 use axum::middleware::from_fn;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -37,7 +37,7 @@ use substring::Substring;
 use tokio::signal;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
-use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
+use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
@@ -47,6 +47,39 @@ mod serve;
 mod storage;
 
 static HEALTH_CHECK_RUNNING: AtomicBool = AtomicBool::new(true);
+
+// Compression predicate: a default-deny whitelist of well-compressing content
+// types, and never compress partial/range responses (compressing them would
+// corrupt Content-Range / Content-Length and break range semantics).
+// Pre-compressed `.br`/`.gz` already carry Content-Encoding so tower-http
+// skips them regardless.
+#[derive(Clone, Copy)]
+struct Compressible;
+
+impl Predicate for Compressible {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        if response.headers().contains_key(header::CONTENT_RANGE) {
+            return false;
+        }
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        content_type.starts_with("text/")
+            || content_type.starts_with("application/javascript")
+            || content_type.starts_with("application/json")
+            || content_type.starts_with("application/manifest+json")
+            || content_type.starts_with("application/xml")
+            || content_type.starts_with("application/rss+xml")
+            || content_type.starts_with("application/atom+xml")
+            || content_type.starts_with("application/wasm")
+            || content_type.starts_with("image/svg+xml")
+    }
+}
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -86,7 +119,7 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
     let builder = ServiceBuilder::new().layer(HandleErrorLayer::new(handle_error));
     let size = config.compress_min_length;
     let app = if size > 0 {
-        let predicate = SizeAbove::new(size).and(NotForContentType::IMAGES);
+        let predicate = SizeAbove::new(size).and(Compressible);
         app.layer(
             builder
                 .layer(CompressionLayer::new().compress_when(predicate))
@@ -189,10 +222,12 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
 async fn serve(
     State(config): State<Arc<Config>>,
     ClientIp(ip): ClientIp,
+    method: Method,
     req_headers: HeaderMap,
     uri: Uri,
 ) -> Result<Response> {
     let path = uri.path();
+    let is_head = method == Method::HEAD;
 
     // IP access control: blocklist takes priority, then allowlist
     if !config.ip_blocklist.is_empty() && config.ip_blocklist.iter().any(|net| net.contains(&ip)) {
@@ -286,7 +321,7 @@ async fn serve(
     for current_file in [
         Some(file.clone()),
         config.fallback_html_404.then(|| format!("{file}.html")),
-        config.fallback_index_404.then(|| index.clone()),
+        config.fallback_index_404.then(|| index.to_string()),
     ]
     .into_iter()
     .flatten()
@@ -305,6 +340,9 @@ async fn serve(
             if_modified_since: if_modified_since.clone(),
             accept_encoding: accept_encoding.clone(),
             read_max_size: config.read_max_size,
+            head: is_head,
+            request_path: path.to_string(),
+            request_query: uri.query().map(|q| q.to_string()),
         })
         .await
         {

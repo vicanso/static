@@ -77,9 +77,9 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
 #[derive(Debug, Clone, Default)]
 pub struct StaticServeParams {
     pub file: String,
-    pub index: String,
+    pub index: Arc<str>,
     pub autoindex: bool,
-    pub cache_control: String,
+    pub cache_control: Arc<str>,
     pub cache_control_map: Arc<HashMap<String, String>>,
     pub html_replaces: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
     pub cache_size: usize,
@@ -89,6 +89,9 @@ pub struct StaticServeParams {
     pub if_modified_since: Option<String>,
     pub accept_encoding: Option<String>,
     pub read_max_size: u64,
+    pub head: bool,
+    pub request_path: String,
+    pub request_query: Option<String>,
 }
 
 #[derive(Clone)]
@@ -160,6 +163,16 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     let is_dir = meta.is_dir();
     if is_dir && !params.autoindex && params.index.is_empty() {
         return Err(Error::NotFound { file: file.clone() });
+    }
+    // Directory served without a trailing slash: 301 to add it so that
+    // relative URLs in the served page resolve correctly.
+    if is_dir && !params.request_path.ends_with('/') {
+        let mut location = format!("{}/", params.request_path);
+        if let Some(query) = &params.request_query {
+            location.push('?');
+            location.push_str(query);
+        }
+        return Err(Error::MovedPermanently { location });
     }
     let mut headers = Vec::with_capacity(8);
     headers.push((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")));
@@ -235,7 +248,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         {
             cc.clone()
         } else {
-            params.cache_control.clone()
+            params.cache_control.to_string()
         }
     };
     if let Ok(v) = HeaderValue::try_from(cache_control) {
@@ -308,7 +321,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
 
     // read html or small file
     let read_file = precompressed_file.as_deref().unwrap_or(&file);
-    let body = if is_html || size < params.read_max_size {
+    let body = if !params.head && (is_html || size < params.read_max_size) {
         let mut buf = storage
             .dal
             .read(read_file)
@@ -441,6 +454,13 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
                 .into_iter()
                 .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING),
         );
+        return Ok(resp);
+    }
+
+    // HEAD: respond with headers only — never read or stream the body.
+    if params.head {
+        let mut resp = Response::new(Body::empty());
+        resp.headers_mut().extend(file_info.headers);
         return Ok(resp);
     }
 

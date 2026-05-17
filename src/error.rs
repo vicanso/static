@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use axum::BoxError;
-use axum::http::{Method, StatusCode, Uri, header};
+use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use snafu::Snafu;
 use std::sync::OnceLock;
@@ -35,6 +35,9 @@ pub enum Error {
 
     #[snafu(display("Forbidden"))]
     Forbidden,
+
+    #[snafu(display("Moved permanently to {location}"))]
+    MovedPermanently { location: String },
 
     #[snafu(display("Opendal error: {source}"))]
     #[snafu(context(false))]
@@ -87,6 +90,16 @@ fn error_template() -> &'static str {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        // Normalization redirect (e.g. directory missing its trailing slash):
+        // 301 with Location, no body.
+        if let Error::MovedPermanently { location } = self {
+            let mut resp = StatusCode::MOVED_PERMANENTLY.into_response();
+            if let Ok(v) = HeaderValue::try_from(location) {
+                resp.headers_mut().insert(header::LOCATION, v);
+            }
+            return resp;
+        }
+
         let is_not_found = self.is_not_found();
         let status = if is_not_found {
             StatusCode::NOT_FOUND

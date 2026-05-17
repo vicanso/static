@@ -42,6 +42,16 @@ impl Storage {
                     message: format!("Path traversal attempt blocked, file: {file}"),
                 });
             }
+            // `absolutize` is purely lexical. Harden against symlinks that
+            // escape the (already-canonical) root: if the target exists, its
+            // canonical path must also stay under the root.
+            if let Ok(canonical) = full_path.canonicalize()
+                && !canonical.starts_with(root_path)
+            {
+                return Err(Error::InvalidFile {
+                    message: format!("Path escapes root via symlink, file: {file}"),
+                });
+            }
         }
         Ok(())
     }
