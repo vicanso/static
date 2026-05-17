@@ -201,6 +201,23 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
                 .first_or_octet_stream()
                 .to_string()
         });
+    // Web-critical types that some MIME databases miss. Only fill in when the
+    // type could not be determined (missing or generic octet-stream) so an
+    // explicit type set by the storage backend still wins.
+    let content_type = if content_type.is_empty() || content_type == "application/octet-stream" {
+        match Path::new(&file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("wasm") => "application/wasm".to_string(),
+            Some("mjs") => "text/javascript".to_string(),
+            _ => content_type,
+        }
+    } else {
+        content_type
+    };
     let mut is_html = false;
     let cache_control: String = if content_type.contains("text/html") {
         is_html = true;
@@ -309,6 +326,13 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     } else {
         None
     };
+    // Pre-compressed responses are encoding-specific (e.g. `.br` bytes with
+    // `Content-Encoding: br`). The in-memory cache key is the logical path and
+    // is NOT encoding-aware, so caching them would serve the wrong encoding to
+    // a client that negotiated a different one. Only identity responses are
+    // safe to cache (any client can receive them; the global CompressionLayer
+    // still compresses on the way out per that client's Accept-Encoding).
+    let is_precompressed = precompressed_file.is_some();
     let read_path = precompressed_file.unwrap_or_else(|| file.clone());
     let info = FileInfo {
         headers,
@@ -317,7 +341,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         read_file: read_path,
         last_modified_secs,
     };
-    if params.cache_size > 0 && !is_html && info.body.is_some() {
+    if params.cache_size > 0 && !is_html && !is_precompressed && info.body.is_some() {
         set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
     }
 
