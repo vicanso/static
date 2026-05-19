@@ -43,6 +43,7 @@ use tracing_subscriber::FmtSubscriber;
 
 mod config;
 mod error;
+mod metrics;
 mod serve;
 mod storage;
 
@@ -81,7 +82,7 @@ impl Predicate for Compressible {
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(delay: Duration) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -96,12 +97,15 @@ async fn shutdown_signal() {
             .await;
         info!("SIGTERM received, health check will return 500");
         HEALTH_CHECK_RUNNING.store(false, Ordering::Relaxed);
-        // 等待5秒
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Drain window: keep serving in-flight requests while /health reports
+        // 500 so the load balancer can deregister this instance.
+        tokio::time::sleep(delay).await;
     };
 
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+    #[cfg(not(unix))]
+    let _ = delay;
 
     tokio::select! {
         _ = ctrl_c => {},
@@ -111,10 +115,13 @@ async fn shutdown_signal() {
 }
 
 async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .fallback(get(serve))
-        .with_state(config.clone());
+    let mut router = Router::new().route("/health", get(health_check));
+    if config.metrics_enabled {
+        router = router.route("/metrics", get(metrics_handler));
+    }
+    // `fallback(serve)` (not `get(serve)`) so OPTIONS reaches the handler for
+    // CORS preflight; non-GET/HEAD/OPTIONS methods get a 405 there.
+    let app = router.fallback(serve).with_state(config.clone());
 
     let builder = ServiceBuilder::new().layer(HandleErrorLayer::new(handle_error));
     let size = config.compress_min_length;
@@ -133,6 +140,9 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
     } else {
         app
     };
+    // Outermost layer: records metrics and strips the internal
+    // `x-original-size` header so it never reaches the client.
+    let app = app.layer(from_fn(track_metrics));
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     info!("server running on http://{}", config.listen_addr);
@@ -141,7 +151,7 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(config.shutdown_delay))
     .await?;
     Ok(())
 }
@@ -218,6 +228,128 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
     response
 }
 
+// Outermost middleware: record one metric sample per response and strip the
+// internal `x-original-size` header (used only by access_log / metrics to know
+// the pre-compression body size) so it is never exposed to clients.
+async fn track_metrics(req: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let bytes = response
+        .headers()
+        .get(X_ORIGINAL_SIZE_HEADER_NAME.as_str())
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    metrics::record_request(response.status().as_u16(), bytes);
+    response
+        .headers_mut()
+        .remove(X_ORIGINAL_SIZE_HEADER_NAME.as_str());
+    response
+}
+
+async fn metrics_handler() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics::render(),
+    )
+        .into_response()
+}
+
+fn method_not_allowed() -> Response {
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    resp.headers_mut().insert(
+        header::ALLOW,
+        HeaderValue::from_static("GET, HEAD, OPTIONS"),
+    );
+    resp
+}
+
+// Resolve the `Access-Control-Allow-Origin` value for a request.
+// Returns `(header_value, needs_vary_origin)`, or `None` when CORS is off or
+// the origin is not allowed.
+fn cors_origin(config: &Config, origin: Option<&str>) -> Option<(String, bool)> {
+    let allow = config.cors_allow_origin.as_deref()?.trim();
+    if allow == "*" {
+        // "*" is invalid alongside credentials — echo the request origin.
+        if config.cors_allow_credentials {
+            return origin.map(|o| (o.to_string(), true));
+        }
+        return Some(("*".to_string(), false));
+    }
+    let mut first = None;
+    let mut count = 0usize;
+    for item in allow.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        count += 1;
+        if first.is_none() {
+            first = Some(item.to_string());
+        }
+        if origin == Some(item) {
+            return Some((item.to_string(), true));
+        }
+    }
+    // A single fixed origin is always advertised (no per-request variance).
+    if count == 1 {
+        return first.map(|o| (o, false));
+    }
+    None
+}
+
+// Apply custom response headers, the nosniff default, and CORS headers to a
+// response just before it is returned.
+fn apply_common_headers(resp: &mut Response, config: &Config, origin: Option<&str>) {
+    for (key, value) in config.response_headers.iter() {
+        resp.headers_mut().insert(key, value.clone());
+    }
+    if config.content_type_nosniff && !resp.headers().contains_key(header::X_CONTENT_TYPE_OPTIONS) {
+        resp.headers_mut().insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+    }
+    if let Some((acao, vary_origin)) = cors_origin(config, origin) {
+        if let Ok(v) = HeaderValue::try_from(acao) {
+            resp.headers_mut()
+                .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        if config.cors_allow_credentials {
+            resp.headers_mut().insert(
+                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                HeaderValue::from_static("true"),
+            );
+        }
+        if vary_origin {
+            resp.headers_mut()
+                .append(header::VARY, HeaderValue::from_static("Origin"));
+        }
+    }
+}
+
+fn cors_preflight(config: &Config, origin: Option<&str>) -> Response {
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::NO_CONTENT;
+    apply_common_headers(&mut resp, config, origin);
+    if let Ok(v) = HeaderValue::try_from(config.cors_allow_methods.clone()) {
+        resp.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
+    }
+    if let Some(h) = &config.cors_allow_headers
+        && let Ok(v) = HeaderValue::try_from(h.clone())
+    {
+        resp.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
+    }
+    if let Some(age) = &config.cors_max_age
+        && let Ok(v) = HeaderValue::try_from(age.clone())
+    {
+        resp.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, v);
+    }
+    resp
+}
+
 // 处理函数
 async fn serve(
     State(config): State<Arc<Config>>,
@@ -235,6 +367,23 @@ async fn serve(
     }
     if !config.ip_allowlist.is_empty() && !config.ip_allowlist.iter().any(|net| net.contains(&ip)) {
         return Err(Error::Forbidden);
+    }
+
+    let origin = req_headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+
+    // CORS preflight / method gating, before Basic Auth so a browser preflight
+    // (which carries no credentials) is not rejected with 401.
+    if method == Method::OPTIONS {
+        if config.cors_allow_origin.is_some() {
+            return Ok(cors_preflight(&config, origin.as_deref()));
+        }
+        return Ok(method_not_allowed());
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return Ok(method_not_allowed());
     }
 
     // Basic Auth
@@ -269,9 +418,7 @@ async fn serve(
             if let Ok(location) = HeaderValue::try_from(to.as_str()) {
                 resp.headers_mut().insert(header::LOCATION, location);
             }
-            for (key, value) in config.response_headers.iter() {
-                resp.headers_mut().insert(key, value.clone());
-            }
+            apply_common_headers(&mut resp, &config, origin.as_deref());
             return Ok(resp);
         }
     }
@@ -290,6 +437,10 @@ async fn serve(
     let index = config.index_file.clone();
     let range = req_headers
         .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let if_range = req_headers
+        .get(header::IF_RANGE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
     let if_none_match = if config.not_modified {
@@ -336,6 +487,7 @@ async fn serve(
             cache_size: config.cache_size,
             cache_ttl: config.cache_ttl,
             range: range.clone(),
+            if_range: if_range.clone(),
             if_none_match: if_none_match.clone(),
             if_modified_since: if_modified_since.clone(),
             accept_encoding: accept_encoding.clone(),
@@ -347,9 +499,7 @@ async fn serve(
         .await
         {
             Ok(mut response) => {
-                for (key, value) in config.response_headers.iter() {
-                    response.headers_mut().insert(key, value.clone());
-                }
+                apply_common_headers(&mut response, &config, origin.as_deref());
                 return Ok(response);
             }
             Err(e) if e.is_not_found() => {
@@ -371,9 +521,7 @@ async fn serve(
         );
         resp.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        for (key, value) in config.response_headers.iter() {
-            resp.headers_mut().insert(key, value.clone());
-        }
+        apply_common_headers(&mut resp, &config, origin.as_deref());
         return Ok(resp);
     }
     Err(last_err)
@@ -400,11 +548,19 @@ fn init_logger() {
             time::format_description::well_known::Rfc3339,
         )
     });
-    let subscriber = FmtSubscriber::builder()
+    let builder = FmtSubscriber::builder()
         .with_max_level(level)
-        .with_timer(timer)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+        .with_timer(timer);
+    let json = std::env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json {
+        tracing::subscriber::set_global_default(builder.json().finish())
+            .expect("setting default subscriber failed");
+    } else {
+        tracing::subscriber::set_global_default(builder.finish())
+            .expect("setting default subscriber failed");
+    }
 }
 
 fn main() {

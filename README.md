@@ -9,18 +9,19 @@ It uses [Apache OpenDAL](https://github.com/apache/opendal) as a unified storage
 ## Features
 
 - Multiple storage backends via OpenDAL — S3, FTP, GridFS, local filesystem
-- Built-in gzip / brotli / zstd compression, plus pre-compressed file support
+- Built-in gzip / brotli / zstd compression, plus pre-compressed file support (`.br` / `.zst` / `.gz`)
 - TinyUFO LRU cache with configurable size and TTL
-- HTTP Range requests (206 Partial Content) for resumable downloads and media seeking
+- HTTP Range requests (206 Partial Content) with `If-Range`, for resumable downloads and media seeking
 - Optional 304 Not Modified via ETag / If-None-Match
 - Directory auto-indexing
 - Dynamic HTML content replacement
-- Custom response headers
+- Custom response headers, with secure `X-Content-Type-Options: nosniff` by default
+- CORS support, including preflight handling
 - SPA fallback mode
 - Basic Auth and IP allow / block lists
 - URL redirect rules
-- Graceful shutdown with SIGTERM connection draining
-- Access logging
+- Graceful shutdown with a configurable SIGTERM drain window
+- Access logging (text or JSON) and a Prometheus `/metrics` endpoint
 
 ## Quick Start
 
@@ -46,6 +47,7 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_LISTEN_ADDR` | `0.0.0.0:3000` | Listen address |
 | `STATIC_THREADS` | num CPUs | Tokio worker threads |
 | `STATIC_TIMEOUT` | `30s` | Request timeout |
+| `STATIC_SHUTDOWN_DELAY` | `5s` | SIGTERM drain window: `/health` returns 500 for this long before shutdown |
 
 ### Caching
 
@@ -62,7 +64,7 @@ Every option is set via an environment variable and parsed once at startup.
 | Variable | Default | Description |
 |---|---|---|
 | `STATIC_COMPRESS_MIN_LENGTH` | `256` | Minimum response size in bytes to compress |
-| `STATIC_PRECOMPRESSED` | `false` | Serve `.br` / `.gz` siblings (e.g. `app.js.br` for `app.js`) when the client supports the encoding, skipping runtime compression |
+| `STATIC_PRECOMPRESSED` | `false` | Serve `.br` / `.zst` / `.gz` siblings (e.g. `app.js.br` for `app.js`) when the client supports the encoding, skipping runtime compression. Negotiation is `q`-value aware (a `br;q=0` is honored as a refusal). |
 
 ### Routing & Fallback
 
@@ -90,6 +92,23 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_HTML_REPLACE_*` | — | Replace HTML content, e.g. `STATIC_HTML_REPLACE_{{HOST}}=https://test.com` replaces `{{HOST}}` with `https://test.com` |
 | `STATIC_RESPONSE_HEADER_*` | — | Add a custom response header, e.g. `STATIC_RESPONSE_HEADER_X_FRAME_OPTIONS=DENY` adds `x-frame-options: DENY` to every response |
 | `STATIC_ERROR_PAGE` | — | Filesystem path to a custom error page template for all error statuses (uses `{{STATUS}}` / `{{REASON}}`). See [Custom Error Pages](#custom-error-pages). If set but unreadable, the server exits at startup. |
+| `STATIC_CONTENT_TYPE_NOSNIFF` | `true` | Add `X-Content-Type-Options: nosniff` to responses (skipped if you set that header yourself via `STATIC_RESPONSE_HEADER_*`) |
+
+### CORS
+
+| Variable | Default | Description |
+|---|---|---|
+| `STATIC_CORS_ALLOW_ORIGIN` | — | Enables CORS. `*`, or a comma-separated origin allowlist (the request `Origin` is echoed back when it matches). Unset = CORS disabled. See [CORS](#cors). |
+| `STATIC_CORS_ALLOW_METHODS` | `GET, HEAD, OPTIONS` | `Access-Control-Allow-Methods` for preflight responses |
+| `STATIC_CORS_ALLOW_HEADERS` | — | `Access-Control-Allow-Headers` for preflight responses |
+| `STATIC_CORS_MAX_AGE` | — | `Access-Control-Max-Age` in seconds (integer). Invalid value exits at startup. |
+| `STATIC_CORS_ALLOW_CREDENTIALS` | `false` | Add `Access-Control-Allow-Credentials: true` (forces echoing the origin instead of `*`) |
+
+### Observability
+
+| Variable | Default | Description |
+|---|---|---|
+| `STATIC_METRICS` | `true` | Expose Prometheus counters at `GET /metrics`. See [Metrics](#metrics). |
 
 ### I/O & Logging
 
@@ -98,6 +117,7 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_READ_MAX_SIZE` | `250KB` | Max file size buffered in memory; larger files are streamed. Accepts human-readable sizes (`30KB`, `1MB`). |
 | `STATIC_ACCESS_LOG` | `true` | Enable access logging |
 | `LOG_LEVEL` | `INFO` | Log level: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| `LOG_FORMAT` | `text` | Log output format: `text` or `json` |
 
 ## Basic Authentication
 
@@ -191,7 +211,33 @@ Internal error detail (e.g. raw storage errors) is never shown to clients — it
 
 ## Health Check
 
-`GET /health` returns `200 healthy` while the server is running, and `500 unhealthy` after a SIGTERM is received — a 5-second window that lets the load balancer drain connections before shutdown.
+`GET /health` returns `200 healthy` while the server is running, and `500 unhealthy` after a SIGTERM is received — a drain window (default `5s`, set via `STATIC_SHUTDOWN_DELAY`) that lets the load balancer deregister this instance before shutdown.
+
+## CORS
+
+CORS is off until `STATIC_CORS_ALLOW_ORIGIN` is set. It accepts either `*` or a comma-separated allowlist.
+
+```bash
+# Allow any origin
+STATIC_CORS_ALLOW_ORIGIN=*
+
+# Allowlist — the request Origin is echoed back when it matches, with Vary: Origin
+STATIC_CORS_ALLOW_ORIGIN=https://app.example.com,https://admin.example.com
+
+# Preflight tuning
+STATIC_CORS_ALLOW_METHODS=GET, HEAD, OPTIONS
+STATIC_CORS_ALLOW_HEADERS=Authorization, Content-Type
+STATIC_CORS_MAX_AGE=86400
+
+# Credentialed requests — "*" is invalid here, so the matched origin is echoed
+STATIC_CORS_ALLOW_CREDENTIALS=true
+```
+
+`OPTIONS` preflight requests are answered with `204` and the configured CORS headers before Basic Auth runs (so a credential-less browser preflight is never rejected with `401`). When CORS is disabled, `OPTIONS` and other non-`GET`/`HEAD` methods receive `405 Method Not Allowed`.
+
+## Metrics
+
+When `STATIC_METRICS` is `true` (the default), `GET /metrics` returns Prometheus-format counters: total requests, responses by status class, total response bytes, and in-memory cache hits / misses. Like `/health`, it bypasses Basic Auth and IP access control — restrict it at the proxy if exposure is a concern, or set `STATIC_METRICS=false` to remove the route entirely.
 
 ## Storage Backends
 

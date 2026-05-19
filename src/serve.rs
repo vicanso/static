@@ -37,6 +37,24 @@ pub static X_ORIGINAL_SIZE_HEADER_NAME: HeaderName = HeaderName::from_static("x-
 // Includes basic styling and JavaScript for date formatting
 static WEB_HTML: &str = include_str!("templates/autoindex.html");
 
+// Escape text that is interpolated into the autoindex HTML. File names are
+// attacker-influenced (uploads, third-party buckets) so an unescaped `<` or
+// `"` would be a stored XSS in the directory listing.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 async fn get_autoindex_html(path: &str) -> Result<String> {
     let entry_list = get_storage()?
         .dal
@@ -45,15 +63,19 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
         .map_err(|e| Error::Openedal { source: e })?;
     let mut html_rows = String::with_capacity(entry_list.len() * 128);
     for entry in entry_list {
-        let filepath = entry.path();
         let name = entry.name();
         if name.len() <= 1 || name.starts_with('.') {
             continue;
         }
+        // Hide pre-compressed siblings — they are an encoding detail, not
+        // separately browsable resources.
+        if name.ends_with(".br") || name.ends_with(".gz") || name.ends_with(".zst") {
+            continue;
+        }
 
         let meta = entry.metadata();
-        let mut size = "".to_string();
-        let mut last_modified = "".to_string();
+        let mut size = String::new();
+        let mut last_modified = String::new();
         if meta.is_file() {
             size = ByteSize(meta.content_length()).to_string();
             if let Some(value) = meta.last_modified() {
@@ -61,10 +83,21 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
             }
         }
 
+        // href: percent-encode the (single-segment) name, preserving a
+        // trailing slash for directories. display: HTML-escaped.
+        let is_dir_entry = name.ends_with('/');
+        let raw_name = name.trim_end_matches('/');
+        let href = format!(
+            "./{}{}",
+            urlencoding::encode(raw_name),
+            if is_dir_entry { "/" } else { "" }
+        );
+        let display = html_escape(name);
+
         let _ = write!(
             html_rows,
             r###"<tr>
-                <td class="name"><a href="./{filepath}">{name}</a></td>
+                <td class="name"><a href="{href}">{display}</a></td>
                 <td class="size">{size}</td>
                 <td class="lastModified">{last_modified}</td>
             </tr>"###
@@ -72,6 +105,49 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
     }
 
     Ok(WEB_HTML.replace("{{CONTENT}}", &html_rows))
+}
+
+// RFC 7233: a Range request guarded by `If-Range` is only honored when the
+// validator still matches; otherwise the whole representation is returned.
+// A weak validator MUST NOT be used here, so weak ETags never satisfy it.
+fn if_range_satisfied(if_range: &str, etag: Option<&str>, last_modified_secs: Option<i64>) -> bool {
+    let v = if_range.trim();
+    if v.is_empty() || v.starts_with("W/") {
+        return false;
+    }
+    if v.starts_with('"') {
+        return matches!(etag, Some(e) if !e.starts_with("W/") && e == v);
+    }
+    match (parse_http_date(v), last_modified_secs) {
+        (Ok(t), Some(lm)) => t
+            .duration_since(UNIX_EPOCH)
+            .is_ok_and(|d| d.as_secs() as i64 >= lm),
+        _ => false,
+    }
+}
+
+// Quality-value aware `Accept-Encoding` check. `contains()` would wrongly
+// match `br;q=0` (explicit refusal) or substrings; this respects q=0 and the
+// `*` wildcard.
+fn encoding_accepted(accept: &str, target: &str) -> bool {
+    let mut wildcard: Option<f32> = None;
+    for part in accept.split(',') {
+        let mut it = part.split(';');
+        let name = it.next().unwrap_or("").trim();
+        let mut q = 1.0f32;
+        for p in it {
+            if let Some(qs) = p.trim().strip_prefix("q=") {
+                q = qs.parse().unwrap_or(0.0);
+            }
+        }
+        if name.eq_ignore_ascii_case(target) {
+            return q > 0.0;
+        }
+        if name == "*" {
+            wildcard = Some(q);
+        }
+    }
+    wildcard.is_some_and(|q| q > 0.0)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -85,6 +161,7 @@ pub struct StaticServeParams {
     pub cache_size: usize,
     pub cache_ttl: Duration,
     pub range: Option<String>,
+    pub if_range: Option<String>,
     pub if_none_match: Option<String>,
     pub if_modified_since: Option<String>,
     pub accept_encoding: Option<String>,
@@ -146,10 +223,12 @@ fn set_file_to_cache(file: &str, info: &FileInfo, cache_size: usize, cache_ttl: 
 
 async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     let mut file = params.file.clone();
-    if params.cache_size > 0
-        && let Some(info) = get_file_from_cache(&file, params.cache_size)
-    {
-        return Ok(info);
+    if params.cache_size > 0 {
+        if let Some(info) = get_file_from_cache(&file, params.cache_size) {
+            crate::metrics::record_cache_hit();
+            return Ok(info);
+        }
+        crate::metrics::record_cache_miss();
     }
     let storage = get_storage()?;
     storage.validate(&file)?;
@@ -181,7 +260,10 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         let html = get_autoindex_html(&file).await?;
         headers.push((header::CONTENT_TYPE, HeaderValue::from_static("text/html")));
         headers.push((header::CACHE_CONTROL, HeaderValue::from_static("no-cache")));
+        headers.push((header::VARY, HeaderValue::from_static("Accept-Encoding")));
         let body = Bytes::from(html);
+        // Directory listings are mutable (entries change between requests) and
+        // are `no-cache` like HTML — never store them in the in-memory cache.
         let info = FileInfo {
             size: body.len() as u64,
             headers,
@@ -189,9 +271,6 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             read_file: file.clone(),
             last_modified_secs: None,
         };
-        if params.cache_size > 0 {
-            set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
-        }
         return Ok(info);
     }
     if is_dir && !params.index.is_empty() {
@@ -263,10 +342,10 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
         && !is_html
         && !is_dir
     {
-        // Priority: brotli > gzip
-        let candidates: &[(&str, &str)] = &[("br", ".br"), ("gzip", ".gz")];
+        // Priority: brotli > zstd > gzip
+        let candidates: &[(&str, &str)] = &[("br", ".br"), ("zstd", ".zst"), ("gzip", ".gz")];
         for (encoding, ext) in candidates {
-            if accept_encoding.contains(encoding) {
+            if encoding_accepted(accept_encoding, encoding) {
                 let compressed = format!("{file}{ext}");
                 if let Ok(compressed_meta) = storage.dal.stat(&compressed).await {
                     precompressed_file = Some(compressed);
@@ -283,11 +362,11 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     {
         headers.push((header::CONTENT_ENCODING, v));
     }
-    // Add Vary: Accept-Encoding when precompressed feature is enabled so CDN
-    // caches compressed and uncompressed variants separately
-    if params.accept_encoding.is_some() && !is_html && !is_dir {
-        headers.push((header::VARY, HeaderValue::from_static("Accept-Encoding")));
-    }
+    // The global CompressionLayer may compress this response on the fly based
+    // on the client's Accept-Encoding (and `.br`/`.zst`/`.gz` negotiation
+    // above also varies by it), so always advertise the variance — otherwise a
+    // shared cache can hand a compressed body to a client that can't decode it.
+    headers.push((header::VARY, HeaderValue::from_static("Accept-Encoding")));
 
     let size = meta.content_length();
     // Extract last_modified once so it can be used for both ETag and Last-Modified header
@@ -464,10 +543,28 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         return Ok(resp);
     }
 
-    let range = params
-        .range
-        .as_deref()
-        .and_then(|r| parse_range(r, total_size));
+    // If-Range: only honor the Range when the cached validator still matches;
+    // otherwise fall through to a full 200 so a resumed download of a changed
+    // file is not silently corrupted.
+    let honor_range = match params.if_range.as_deref() {
+        None => true,
+        Some(ir) => {
+            let etag = file_info
+                .headers
+                .iter()
+                .find(|(k, _)| *k == header::ETAG)
+                .and_then(|(_, v)| v.to_str().ok());
+            if_range_satisfied(ir, etag, file_info.last_modified_secs)
+        }
+    };
+    let range = if honor_range {
+        params
+            .range
+            .as_deref()
+            .and_then(|r| parse_range(r, total_size))
+    } else {
+        None
+    };
 
     // 416 Range Not Satisfiable
     if matches!(range, Some(RangeValue::NotSatisfiable)) {

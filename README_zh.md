@@ -9,18 +9,19 @@
 ## 特性
 
 - 基于 OpenDAL 的多存储后端——S3、FTP、GridFS、本地文件系统
-- 内置 gzip / brotli / zstd 压缩，并支持预压缩文件
+- 内置 gzip / brotli / zstd 压缩，并支持预压缩文件（`.br` / `.zst` / `.gz`）
 - TinyUFO LRU 缓存，大小与 TTL 可配置
-- HTTP Range 请求（206 Partial Content），支持断点续传与音视频拖拽
+- HTTP Range 请求（206 Partial Content），支持 `If-Range`、断点续传与音视频拖拽
 - 可选的 304 Not Modified（基于 ETag / If-None-Match）
 - 目录自动索引
 - HTML 内容动态替换
-- 自定义响应头
+- 自定义响应头，默认附带安全的 `X-Content-Type-Options: nosniff`
+- CORS 支持，含预检（preflight）处理
 - SPA 回退模式
 - Basic Auth 与 IP 黑白名单
 - URL 重定向规则
-- SIGTERM 优雅关闭并排空连接
-- 访问日志
+- SIGTERM 优雅关闭，排空窗口可配置
+- 访问日志（文本或 JSON）与 Prometheus `/metrics` 端点
 
 ## 快速开始
 
@@ -46,6 +47,7 @@ docker run -d --restart=always \
 | `STATIC_LISTEN_ADDR` | `0.0.0.0:3000` | 监听地址 |
 | `STATIC_THREADS` | CPU 核心数 | tokio 工作线程数 |
 | `STATIC_TIMEOUT` | `30s` | 请求超时时间 |
+| `STATIC_SHUTDOWN_DELAY` | `5s` | SIGTERM 排空窗口：关闭前 `/health` 持续返回 500 的时长 |
 
 ### 缓存
 
@@ -62,7 +64,7 @@ docker run -d --restart=always \
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `STATIC_COMPRESS_MIN_LENGTH` | `256` | 启用压缩的最小响应字节数 |
-| `STATIC_PRECOMPRESSED` | `false` | 当客户端支持对应编码时，直接返回 `.br` / `.gz` 副本（如 `app.js` 对应 `app.js.br`），跳过运行时压缩 |
+| `STATIC_PRECOMPRESSED` | `false` | 当客户端支持对应编码时，直接返回 `.br` / `.zst` / `.gz` 副本（如 `app.js` 对应 `app.js.br`），跳过运行时压缩。协商遵循 `q` 值（`br;q=0` 视为明确拒绝）。 |
 
 ### 路由与回退
 
@@ -90,6 +92,23 @@ docker run -d --restart=always \
 | `STATIC_HTML_REPLACE_*` | — | 替换 HTML 内容，如 `STATIC_HTML_REPLACE_{{HOST}}=https://test.com` 将 `{{HOST}}` 替换为 `https://test.com` |
 | `STATIC_RESPONSE_HEADER_*` | — | 添加自定义响应头，如 `STATIC_RESPONSE_HEADER_X_FRAME_OPTIONS=DENY` 为每个响应添加 `x-frame-options: DENY` |
 | `STATIC_ERROR_PAGE` | — | 自定义错误页模板的文件系统路径，适用所有错误状态（用 `{{STATUS}}` / `{{REASON}}` 占位符）。见[自定义错误页](#自定义错误页)。设置了但读取失败则启动时退出。 |
+| `STATIC_CONTENT_TYPE_NOSNIFF` | `true` | 为响应添加 `X-Content-Type-Options: nosniff`（若已通过 `STATIC_RESPONSE_HEADER_*` 自行设置该头则跳过） |
+
+### CORS
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `STATIC_CORS_ALLOW_ORIGIN` | — | 启用 CORS。`*`，或逗号分隔的来源白名单（命中时回显请求的 `Origin`）。未设置则禁用 CORS。见[CORS](#cors)。 |
+| `STATIC_CORS_ALLOW_METHODS` | `GET, HEAD, OPTIONS` | 预检响应的 `Access-Control-Allow-Methods` |
+| `STATIC_CORS_ALLOW_HEADERS` | — | 预检响应的 `Access-Control-Allow-Headers` |
+| `STATIC_CORS_MAX_AGE` | — | `Access-Control-Max-Age`，单位秒（整数）。非法值启动时退出。 |
+| `STATIC_CORS_ALLOW_CREDENTIALS` | `false` | 添加 `Access-Control-Allow-Credentials: true`（此时强制回显 origin 而非 `*`） |
+
+### 可观测性
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `STATIC_METRICS` | `true` | 在 `GET /metrics` 暴露 Prometheus 计数器。见[指标](#指标)。 |
 
 ### I/O 与日志
 
@@ -98,6 +117,7 @@ docker run -d --restart=always \
 | `STATIC_READ_MAX_SIZE` | `250KB` | 直接读入内存的最大文件大小，超过则流式传输。支持可读格式（`30KB`、`1MB`）。 |
 | `STATIC_ACCESS_LOG` | `true` | 启用访问日志 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` |
+| `LOG_FORMAT` | `text` | 日志输出格式：`text` 或 `json` |
 
 ## Basic 认证
 
@@ -191,7 +211,33 @@ STATIC_CACHE_CONTROL_EXT_JSON=public, max-age=300
 
 ## 健康检查
 
-`GET /health` 在服务正常运行时返回 `200 healthy`，收到 SIGTERM 信号后返回 `500 unhealthy`——提供 5 秒窗口让负载均衡器在退出前排空连接。
+`GET /health` 在服务正常运行时返回 `200 healthy`，收到 SIGTERM 信号后返回 `500 unhealthy`——提供一个排空窗口（默认 `5s`，通过 `STATIC_SHUTDOWN_DELAY` 设置）让负载均衡器在退出前摘除该实例。
+
+## CORS
+
+未设置 `STATIC_CORS_ALLOW_ORIGIN` 时 CORS 处于关闭状态。其值可为 `*` 或逗号分隔的白名单。
+
+```bash
+# 允许任意来源
+STATIC_CORS_ALLOW_ORIGIN=*
+
+# 白名单——命中时回显请求的 Origin，并附带 Vary: Origin
+STATIC_CORS_ALLOW_ORIGIN=https://app.example.com,https://admin.example.com
+
+# 预检调优
+STATIC_CORS_ALLOW_METHODS=GET, HEAD, OPTIONS
+STATIC_CORS_ALLOW_HEADERS=Authorization, Content-Type
+STATIC_CORS_MAX_AGE=86400
+
+# 携带凭据的请求——此时 "*" 非法，故回显命中的 origin
+STATIC_CORS_ALLOW_CREDENTIALS=true
+```
+
+`OPTIONS` 预检请求在 Basic Auth 之前以 `204` 加上配置的 CORS 头响应（这样无凭据的浏览器预检不会被 `401` 拒绝）。CORS 关闭时，`OPTIONS` 及其它非 `GET`/`HEAD` 方法返回 `405 Method Not Allowed`。
+
+## 指标
+
+当 `STATIC_METRICS` 为 `true`（默认）时，`GET /metrics` 返回 Prometheus 格式的计数器：请求总数、按状态码类别的响应数、响应字节总数，以及内存缓存命中/未命中。与 `/health` 一样，它绕过 Basic Auth 与 IP 访问控制——如有暴露顾虑请在前置代理处限制，或设置 `STATIC_METRICS=false` 彻底移除该路由。
 
 ## 存储后端
 

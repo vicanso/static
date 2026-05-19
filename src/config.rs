@@ -47,6 +47,14 @@ pub struct Config {
     pub access_log: bool,
     pub read_max_size: u64,
     pub threads: usize,
+    pub content_type_nosniff: bool,
+    pub shutdown_delay: Duration,
+    pub metrics_enabled: bool,
+    pub cors_allow_origin: Option<String>,
+    pub cors_allow_methods: String,
+    pub cors_allow_headers: Option<String>,
+    pub cors_max_age: Option<String>,
+    pub cors_allow_credentials: bool,
 }
 
 // Parse an optional humantime duration from env. Absent -> default;
@@ -98,6 +106,14 @@ struct EnvConfig {
     ip_blocklist: String,
     basic_auth_realm: String,
     error_page: Option<String>,
+    content_type_nosniff: bool,
+    shutdown_delay: Option<String>,
+    metrics: bool,
+    cors_allow_origin: Option<String>,
+    cors_allow_methods: String,
+    cors_allow_headers: Option<String>,
+    cors_max_age: Option<String>,
+    cors_allow_credentials: bool,
 }
 
 impl Default for EnvConfig {
@@ -122,6 +138,14 @@ impl Default for EnvConfig {
             ip_blocklist: String::new(),
             basic_auth_realm: "static".to_string(),
             error_page: None,
+            content_type_nosniff: true,
+            shutdown_delay: None,
+            metrics: true,
+            cors_allow_origin: None,
+            cors_allow_methods: "GET, HEAD, OPTIONS".to_string(),
+            cors_allow_headers: None,
+            cors_max_age: None,
+            cors_allow_credentials: false,
         }
     }
 }
@@ -198,6 +222,13 @@ impl Config {
             }
         }
 
+        if let Some(ref v) = env_cfg.cors_max_age
+            && !v.chars().all(|c| c.is_ascii_digit())
+        {
+            error!("Invalid STATIC_CORS_MAX_AGE={v}: must be an integer number of seconds");
+            std::process::exit(1)
+        }
+
         Self {
             timeout: parse_duration_or_exit(
                 "STATIC_TIMEOUT",
@@ -235,6 +266,18 @@ impl Config {
             error_page: env_cfg.error_page,
             response_headers,
             threads: env_cfg.threads.max(1),
+            content_type_nosniff: env_cfg.content_type_nosniff,
+            shutdown_delay: parse_duration_or_exit(
+                "STATIC_SHUTDOWN_DELAY",
+                env_cfg.shutdown_delay.as_deref(),
+                Duration::from_secs(5),
+            ),
+            metrics_enabled: env_cfg.metrics,
+            cors_allow_origin: env_cfg.cors_allow_origin.filter(|v| !v.trim().is_empty()),
+            cors_allow_methods: env_cfg.cors_allow_methods,
+            cors_allow_headers: env_cfg.cors_allow_headers.filter(|v| !v.trim().is_empty()),
+            cors_max_age: env_cfg.cors_max_age,
+            cors_allow_credentials: env_cfg.cors_allow_credentials,
         }
     }
 }
