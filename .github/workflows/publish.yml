@@ -60,15 +60,23 @@ jobs:
       - name: Build and push by digest
         id: docker_build
         uses: docker/build-push-action@v6
+        env:
+          # Push by digest only: no per-arch (:amd64/:arm64) tag is created on
+          # Docker Hub. The `merge` job assembles the single versioned manifest.
+          IMAGE_OUTPUT: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # New layers (built by this Dockerfile) get zstd; FROM-inherited
+          # debian:bookworm-slim layers keep their original gzip so their blob
+          # digests stay byte-identical to upstream and get globally reused
+          # across debian-based images. oci-mediatypes=true is required for
+          # any zstd layer to be recognised by the registry/clients.
+          ZSTD_OPTS: compression=zstd,compression-level=3,force-compression=false,oci-mediatypes=true
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform.arch }}
           build-args: |
             GIT_COMMIT_ID=${{ github.sha }}
-          # Push by digest only: no per-arch (:amd64/:arm64) tag is created on
-          # Docker Hub. The `merge` job assembles the single versioned manifest.
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: ${{ env.IMAGE_OUTPUT }},${{ env.ZSTD_OPTS }}
       - name: Export digest
         run: |
           mkdir -p ${{ runner.temp }}/digests

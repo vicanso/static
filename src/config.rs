@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::serve::HtmlReplacer;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -31,7 +32,8 @@ pub struct Config {
     pub cache_control: Arc<str>,
     pub fallback_index_404: bool,
     pub fallback_html_404: bool,
-    pub html_replaces: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
+    // Pre-built once at startup; None when no STATIC_HTML_REPLACE_* is set.
+    pub html_replacer: Option<Arc<HtmlReplacer>>,
     pub cache_control_map: Arc<HashMap<String, String>>,
     pub redirects: Arc<Vec<(String, u16, String)>>,
     pub ip_allowlist: Arc<Vec<IpNet>>,
@@ -256,7 +258,7 @@ impl Config {
                 env_cfg.read_max_size.as_deref(),
                 bytesize::ByteSize::kb(250).0,
             ),
-            html_replaces: Arc::new(html_replaces),
+            html_replacer: HtmlReplacer::new(html_replaces).map(Arc::new),
             cache_control_map: Arc::new(cache_control_map),
             redirects: Arc::new(redirects),
             ip_allowlist: Arc::new(parse_ip_list(&env_cfg.ip_allowlist)),

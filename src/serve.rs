@@ -14,10 +14,10 @@
 
 use crate::error::{Error, Result};
 use crate::storage::get_storage;
+use aho_corasick::AhoCorasick;
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use bstr::ByteSlice;
 use bytes::Bytes;
 use bytesize::ByteSize;
 use httpdate::{fmt_http_date, parse_http_date};
@@ -32,6 +32,59 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
 pub static X_ORIGINAL_SIZE_HEADER_NAME: HeaderName = HeaderName::from_static("x-original-size");
+
+// Chunk size for streamed file responses (files >= STATIC_READ_MAX_SIZE).
+// tokio-util's ReaderStream defaults to 4 KiB, which means ~256 wake-ups per
+// MiB of payload — wasteful on large assets like videos, wasm bundles, and
+// fonts. 64 KiB roughly matches typical TCP send-buffer sizing and cuts the
+// wake-up / syscall count ~16x at negligible peak-memory cost per in-flight
+// body. The small/buffered path (size < STATIC_READ_MAX_SIZE) is unaffected —
+// it already returns the whole body as a single Bytes.
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+
+// Pre-built Aho-Corasick automaton over the configured HTML replacement
+// pairs. Built once at startup from STATIC_HTML_REPLACE_* env vars so each
+// HTML response runs a single linear scan over the body — vs the old loop
+// which re-scanned and re-allocated the buffer once per (key,value) pair.
+#[derive(Debug)]
+pub struct HtmlReplacer {
+    automaton: AhoCorasick,
+    replacements: Vec<Vec<u8>>,
+}
+
+impl HtmlReplacer {
+    // Returns `None` when no usable pairs are configured. Empty keys are
+    // dropped on the floor — Aho-Corasick rejects (or, depending on version,
+    // matches infinitely at) zero-length patterns, and an empty replacement
+    // key is almost certainly a misconfiguration (e.g. `STATIC_HTML_REPLACE_=`).
+    pub fn new(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Option<Self> {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            pairs.into_iter().filter(|(k, _)| !k.is_empty()).collect();
+        if pairs.is_empty() {
+            return None;
+        }
+        let patterns: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
+        let automaton = match AhoCorasick::new(&patterns) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to build HTML replacement automaton; replacements disabled"
+                );
+                return None;
+            }
+        };
+        let replacements: Vec<Vec<u8>> = pairs.into_iter().map(|(_, v)| v).collect();
+        Some(Self {
+            automaton,
+            replacements,
+        })
+    }
+
+    pub fn replace_all_bytes(&self, haystack: &[u8]) -> Vec<u8> {
+        self.automaton.replace_all_bytes(haystack, &self.replacements)
+    }
+}
 
 // Static HTML template for directory listing view
 // Includes basic styling and JavaScript for date formatting
@@ -126,28 +179,65 @@ fn if_range_satisfied(if_range: &str, etag: Option<&str>, last_modified_secs: Op
     }
 }
 
-// Quality-value aware `Accept-Encoding` check. `contains()` would wrongly
-// match `br;q=0` (explicit refusal) or substrings; this respects q=0 and the
-// `*` wildcard.
-fn encoding_accepted(accept: &str, target: &str) -> bool {
-    let mut wildcard: Option<f32> = None;
-    for part in accept.split(',') {
-        let mut it = part.split(';');
-        let name = it.next().unwrap_or("").trim();
-        let mut q = 1.0f32;
-        for p in it {
-            if let Some(qs) = p.trim().strip_prefix("q=") {
-                q = qs.parse().unwrap_or(0.0);
+// Parsed `Accept-Encoding` header — built once per request and consulted O(1)
+// per candidate encoding. Replaces a previous `encoding_accepted(accept,
+// target)` helper that re-parsed the whole header for each candidate (called
+// 3x per request for the br/zstd/gzip lookup).
+//
+// Quality-value aware: an explicit `br;q=0` is a refusal of brotli and does
+// NOT fall back to the `*` wildcard. Only an encoding that was never mentioned
+// inherits the wildcard's q value. Encoding names are matched case-insensitively
+// (RFC 7231); `*` is a single literal character so case doesn't apply.
+#[derive(Default)]
+struct EncodingPrefs {
+    br: Option<f32>,
+    zstd: Option<f32>,
+    gzip: Option<f32>,
+    wildcard: Option<f32>,
+}
+
+impl EncodingPrefs {
+    fn parse(accept: &str) -> Self {
+        let mut prefs = Self::default();
+        for part in accept.split(',') {
+            let mut it = part.split(';');
+            let name = it.next().unwrap_or("").trim();
+            let mut q = 1.0f32;
+            for p in it {
+                if let Some(qs) = p.trim().strip_prefix("q=") {
+                    q = qs.parse().unwrap_or(0.0);
+                }
             }
+            let slot: &mut Option<f32> = if name.eq_ignore_ascii_case("br") {
+                &mut prefs.br
+            } else if name.eq_ignore_ascii_case("zstd") {
+                &mut prefs.zstd
+            } else if name.eq_ignore_ascii_case("gzip") {
+                &mut prefs.gzip
+            } else if name == "*" {
+                &mut prefs.wildcard
+            } else {
+                continue;
+            };
+            // First-occurrence wins — matches the prior early-return loop's
+            // behavior on repeated tokens (pathological in practice).
+            slot.get_or_insert(q);
         }
-        if name.eq_ignore_ascii_case(target) {
-            return q > 0.0;
-        }
-        if name == "*" {
-            wildcard = Some(q);
+        prefs
+    }
+
+    fn accepts(&self, encoding: &str) -> bool {
+        let explicit = match encoding {
+            "br" => self.br,
+            "zstd" => self.zstd,
+            "gzip" => self.gzip,
+            _ => None,
+        };
+        match explicit {
+            Some(q) => q > 0.0,
+            None => self.wildcard.is_some_and(|q| q > 0.0),
         }
     }
-    wildcard.is_some_and(|q| q > 0.0)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,27 +247,31 @@ pub struct StaticServeParams {
     pub autoindex: bool,
     pub cache_control: Arc<str>,
     pub cache_control_map: Arc<HashMap<String, String>>,
-    pub html_replaces: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
+    pub html_replacer: Option<Arc<HtmlReplacer>>,
     pub cache_size: usize,
     pub cache_ttl: Duration,
-    pub range: Option<String>,
-    pub if_range: Option<String>,
-    pub if_none_match: Option<String>,
-    pub if_modified_since: Option<String>,
-    pub accept_encoding: Option<String>,
+    // Per-request header echoes — Arc<str> so the fallback retry loop in
+    // main.rs can clone/share them at refcount cost instead of allocating
+    // fresh String copies per iteration.
+    pub range: Option<Arc<str>>,
+    pub if_range: Option<Arc<str>>,
+    pub if_none_match: Option<Arc<str>>,
+    pub if_modified_since: Option<Arc<str>>,
+    pub accept_encoding: Option<Arc<str>>,
     pub read_max_size: u64,
     pub head: bool,
-    pub request_path: String,
-    pub request_query: Option<String>,
+    pub request_path: Arc<str>,
+    pub request_query: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
 struct FileInfoCache {
     expired_at: u64,
-    data: FileInfo,
+    // Arc-shared so cache hits cost a refcount bump, not a deep clone of
+    // `headers` (Vec) + `read_file` (String). Bytes is already cheap-clone.
+    data: Arc<FileInfo>,
 }
 
-#[derive(Clone)]
 struct FileInfo {
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Option<Bytes>,
@@ -192,7 +286,7 @@ fn get_static_cache(size: usize) -> &'static TinyUfo<String, FileInfoCache> {
     STATIC_CACHE.get_or_init(|| TinyUfo::new(size, size))
 }
 
-fn get_file_from_cache(file: &String, cache_size: usize) -> Option<FileInfo> {
+fn get_file_from_cache(file: &String, cache_size: usize) -> Option<Arc<FileInfo>> {
     if let Some(info) = get_static_cache(cache_size).get(file)
         && info.expired_at
             > SystemTime::now()
@@ -205,7 +299,7 @@ fn get_file_from_cache(file: &String, cache_size: usize) -> Option<FileInfo> {
     None
 }
 
-fn set_file_to_cache(file: &str, info: &FileInfo, cache_size: usize, cache_ttl: Duration) {
+fn set_file_to_cache(file: &str, info: Arc<FileInfo>, cache_size: usize, cache_ttl: Duration) {
     let expired_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -215,13 +309,13 @@ fn set_file_to_cache(file: &str, info: &FileInfo, cache_size: usize, cache_ttl: 
         file.to_string(),
         FileInfoCache {
             expired_at,
-            data: info.clone(),
+            data: info,
         },
         1,
     );
 }
 
-async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
+async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     let mut file = params.file.clone();
     if params.cache_size > 0 {
         if let Some(info) = get_file_from_cache(&file, params.cache_size) {
@@ -247,7 +341,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     // relative URLs in the served page resolve correctly.
     if is_dir && !params.request_path.ends_with('/') {
         let mut location = format!("{}/", params.request_path);
-        if let Some(query) = &params.request_query {
+        if let Some(query) = params.request_query.as_deref() {
             location.push('?');
             location.push_str(query);
         }
@@ -271,7 +365,7 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             read_file: file.clone(),
             last_modified_secs: None,
         };
-        return Ok(info);
+        return Ok(Arc::new(info));
     }
     if is_dir && !params.index.is_empty() {
         file = if file.ends_with("/") {
@@ -338,14 +432,16 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     }
     // Try pre-compressed file (.br / .gz) if enabled and client supports it
     let mut precompressed_file = None;
-    if let Some(ref accept_encoding) = params.accept_encoding
+    if let Some(accept_encoding) = params.accept_encoding.as_deref()
         && !is_html
         && !is_dir
     {
-        // Priority: brotli > zstd > gzip
+        // Parse the header once, then test each candidate against the parsed
+        // prefs. Priority: brotli > zstd > gzip.
+        let prefs = EncodingPrefs::parse(accept_encoding);
         let candidates: &[(&str, &str)] = &[("br", ".br"), ("zstd", ".zst"), ("gzip", ".gz")];
         for (encoding, ext) in candidates {
-            if encoding_accepted(accept_encoding, encoding) {
+            if prefs.accepts(encoding) {
                 let compressed = format!("{file}{ext}");
                 if let Ok(compressed_meta) = storage.dal.stat(&compressed).await {
                     precompressed_file = Some(compressed);
@@ -408,11 +504,13 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
             .map_err(|e| Error::Openedal { source: e })?
             .to_vec();
 
-        // Only apply HTML replacements to HTML content
-        if is_html {
-            for (key, value) in params.html_replaces.iter() {
-                buf = buf.replace(key, value);
-            }
+        // Only apply HTML replacements to HTML content. Single pass: the
+        // Aho-Corasick automaton walks the body once and emits one new Vec,
+        // regardless of how many (key, value) pairs are configured.
+        if is_html
+            && let Some(replacer) = &params.html_replacer
+        {
+            buf = replacer.replace_all_bytes(&buf);
         }
         Some(Bytes::from(buf))
     } else {
@@ -426,15 +524,15 @@ async fn get_file(params: &StaticServeParams) -> Result<FileInfo> {
     // still compresses on the way out per that client's Accept-Encoding).
     let is_precompressed = precompressed_file.is_some();
     let read_path = precompressed_file.unwrap_or_else(|| file.clone());
-    let info = FileInfo {
+    let info = Arc::new(FileInfo {
         headers,
         body,
         size,
         read_file: read_path,
         last_modified_secs,
-    };
+    });
     if params.cache_size > 0 && !is_html && !is_precompressed && info.body.is_some() {
-        set_file_to_cache(&file, &info, params.cache_size, params.cache_ttl);
+        set_file_to_cache(&file, info.clone(), params.cache_size, params.cache_ttl);
     }
 
     Ok(info)
@@ -492,9 +590,8 @@ fn parse_range(range_header: &str, total_size: u64) -> Option<RangeValue> {
 }
 
 // 处理函数
-pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
-    let mut file_info = get_file(&params).await?;
-    let read_file = std::mem::take(&mut file_info.read_file);
+pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
+    let file_info = get_file(params).await?;
     let total_size = file_info
         .body
         .as_ref()
@@ -502,23 +599,27 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         .unwrap_or(file_info.size);
 
     // 304 Not Modified
-    if let Some(ref if_none_match) = params.if_none_match
+    if let Some(if_none_match) = params.if_none_match.as_deref()
         && let Some((_, etag_value)) = file_info.headers.iter().find(|(k, _)| *k == header::ETAG)
     {
         let etag_str = etag_value.to_str().unwrap_or_default();
         if if_none_match == "*" || if_none_match.split(',').any(|v| v.trim() == etag_str) {
             let mut resp = StatusCode::NOT_MODIFIED.into_response();
             resp.headers_mut().extend(
-                file_info.headers.into_iter().filter(|(k, _)| {
-                    *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING
-                }),
+                file_info
+                    .headers
+                    .iter()
+                    .filter(|(k, _)| {
+                        *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING
+                    })
+                    .cloned(),
             );
             return Ok(resp);
         }
     }
 
     // 304 Not Modified (If-Modified-Since)
-    if let Some(ref ims) = params.if_modified_since
+    if let Some(ims) = params.if_modified_since.as_deref()
         && let Some(secs) = file_info.last_modified_secs
         && let Ok(ims_time) = parse_http_date(ims)
         && let Ok(ims_secs) = ims_time
@@ -530,8 +631,9 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         resp.headers_mut().extend(
             file_info
                 .headers
-                .into_iter()
-                .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING),
+                .iter()
+                .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING)
+                .cloned(),
         );
         return Ok(resp);
     }
@@ -539,7 +641,8 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
     // HEAD: respond with headers only — never read or stream the body.
     if params.head {
         let mut resp = Response::new(Body::empty());
-        resp.headers_mut().extend(file_info.headers);
+        resp.headers_mut()
+            .extend(file_info.headers.iter().cloned());
         return Ok(resp);
     }
 
@@ -577,8 +680,9 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
         resp.headers_mut().extend(
             file_info
                 .headers
-                .into_iter()
-                .filter(|(k, _)| *k != header::CONTENT_LENGTH),
+                .iter()
+                .filter(|(k, _)| *k != header::CONTENT_LENGTH)
+                .cloned(),
         );
         return Ok(resp);
     }
@@ -587,19 +691,20 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
 
     let mut resp = if let Some(RangeValue::Satisfiable(start, end)) = range {
         let content_length = end - start + 1;
-        let mut resp = if let Some(body) = file_info.body.take() {
+        let mut resp = if let Some(body) = file_info.body.as_ref() {
             body.slice(start as usize..=end as usize).into_response()
         } else {
             let r = get_storage()?
                 .dal
-                .reader(&read_file)
+                .reader(&file_info.read_file)
                 .await
                 .map_err(|e| Error::Openedal { source: e })?;
-            let stream = ReaderStream::new(
+            let stream = ReaderStream::with_capacity(
                 r.into_futures_async_read(start..=end)
                     .await
                     .map_err(|e| Error::Openedal { source: e })?
                     .compat(),
+                STREAM_CHUNK_SIZE,
             );
             Body::from_stream(stream).into_response()
         };
@@ -615,30 +720,30 @@ pub async fn static_serve(params: StaticServeParams) -> Result<Response> {
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
         );
         resp
+    } else if let Some(body) = file_info.body.as_ref() {
+        body.clone().into_response()
     } else {
-        if let Some(body) = file_info.body.take() {
-            body.into_response()
-        } else {
-            let r = get_storage()?
-                .dal
-                .reader(&read_file)
+        let r = get_storage()?
+            .dal
+            .reader(&file_info.read_file)
+            .await
+            .map_err(|e| Error::Openedal { source: e })?;
+        let stream = ReaderStream::with_capacity(
+            r.into_futures_async_read(0..)
                 .await
-                .map_err(|e| Error::Openedal { source: e })?;
-            let stream = ReaderStream::new(
-                r.into_futures_async_read(0..)
-                    .await
-                    .map_err(|e| Error::Openedal { source: e })?
-                    .compat(),
-            );
-            Body::from_stream(stream).into_response()
-        }
+                .map_err(|e| Error::Openedal { source: e })?
+                .compat(),
+            STREAM_CHUNK_SIZE,
+        );
+        Body::from_stream(stream).into_response()
     };
 
     resp.headers_mut().extend(
         file_info
             .headers
-            .into_iter()
-            .filter(|(k, _)| !(is_partial && *k == header::CONTENT_LENGTH)),
+            .iter()
+            .filter(|(k, _)| !(is_partial && *k == header::CONTENT_LENGTH))
+            .cloned(),
     );
 
     Ok(resp)

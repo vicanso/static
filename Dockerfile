@@ -15,14 +15,16 @@ FROM debian:bookworm-slim
 
 EXPOSE 3000
 
-RUN useradd -r -s /bin/false ubuntu
+# Service account with /bin/false to block login; `-m` still creates a home
+# dir so `docker exec -it <container> bash` (invoked explicitly) has a HOME.
+RUN useradd -r -m -s /bin/false rust
 
-COPY --from=builder --chown=ubuntu:ubuntu --chmod=755 /static/target/release/static-serve /usr/local/bin/static-serve
-COPY --from=builder --chown=ubuntu:ubuntu --chmod=755 /static/entrypoint.sh /entrypoint.sh
-COPY --from=builder --chown=ubuntu:ubuntu --chmod=755 /usr/local/bin/httpstat /usr/local/bin/httpstat
+COPY --from=builder --chown=rust:rust --chmod=755 /static/target/release/static-serve /usr/local/bin/static-serve
+COPY --from=builder --chown=rust:rust --chmod=755 /static/entrypoint.sh /entrypoint.sh
+COPY --from=builder --chown=rust:rust --chmod=755 /usr/local/bin/httpstat /usr/local/bin/httpstat
 
 
-USER ubuntu
+USER rust
 
 CMD ["static-serve"]
 

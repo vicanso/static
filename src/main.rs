@@ -27,7 +27,15 @@ use axum::{Router, middleware::Next};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use config::Config;
+use mimalloc::MiMalloc;
 use serve::{StaticServeParams, static_serve};
+
+// Route all allocations through mimalloc. On alloc/free-heavy workloads
+// (header maps, Bytes, cache misses) this typically shaves a few percent off
+// CPU vs the system glibc allocator and reduces fragmentation in long-running
+// processes. Drop-in: no API surface changes.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -435,39 +443,65 @@ async fn serve(
     };
 
     let index = config.index_file.clone();
-    let range = req_headers
+    // Header echoes are stored as Arc<str> so the fallback retry loop below
+    // can share them by refcount instead of allocating new Strings per
+    // iteration. They are also built once here, not inside the loop.
+    let range: Option<Arc<str>> = req_headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string());
-    let if_range = req_headers
+        .map(Arc::from);
+    let if_range: Option<Arc<str>> = req_headers
         .get(header::IF_RANGE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string());
-    let if_none_match = if config.not_modified {
+        .map(Arc::from);
+    let if_none_match: Option<Arc<str>> = if config.not_modified {
         req_headers
             .get(header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string())
+            .map(Arc::from)
     } else {
         None
     };
-    let if_modified_since = if config.not_modified {
+    let if_modified_since: Option<Arc<str>> = if config.not_modified {
         req_headers
             .get(header::IF_MODIFIED_SINCE)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string())
+            .map(Arc::from)
     } else {
         None
     };
-    let accept_encoding = if config.precompressed {
+    let accept_encoding: Option<Arc<str>> = if config.precompressed {
         req_headers
             .get(header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string())
+            .map(Arc::from)
     } else {
         None
     };
     let mut last_err = Error::NotFound { file: file.clone() };
+
+    // Build params once outside the loop and reuse by reference. The fallback
+    // retry loop typically runs once, so previously every Option<String> was
+    // cloned (allocating) on each iteration even though only `file` differs.
+    let mut params = StaticServeParams {
+        index: index.clone(),
+        autoindex: config.autoindex,
+        cache_control: config.cache_control.clone(),
+        cache_control_map: config.cache_control_map.clone(),
+        html_replacer: config.html_replacer.clone(),
+        file: String::new(),
+        cache_size: config.cache_size,
+        cache_ttl: config.cache_ttl,
+        range,
+        if_range,
+        if_none_match,
+        if_modified_since,
+        accept_encoding,
+        read_max_size: config.read_max_size,
+        head: is_head,
+        request_path: Arc::from(path),
+        request_query: uri.query().map(Arc::from),
+    };
 
     for current_file in [
         Some(file.clone()),
@@ -477,27 +511,8 @@ async fn serve(
     .into_iter()
     .flatten()
     {
-        match static_serve(StaticServeParams {
-            index: index.clone(),
-            autoindex: config.autoindex,
-            cache_control: config.cache_control.clone(),
-            cache_control_map: config.cache_control_map.clone(),
-            html_replaces: config.html_replaces.clone(),
-            file: current_file,
-            cache_size: config.cache_size,
-            cache_ttl: config.cache_ttl,
-            range: range.clone(),
-            if_range: if_range.clone(),
-            if_none_match: if_none_match.clone(),
-            if_modified_since: if_modified_since.clone(),
-            accept_encoding: accept_encoding.clone(),
-            read_max_size: config.read_max_size,
-            head: is_head,
-            request_path: path.to_string(),
-            request_query: uri.query().map(|q| q.to_string()),
-        })
-        .await
-        {
+        params.file = current_file;
+        match static_serve(&params).await {
             Ok(mut response) => {
                 apply_common_headers(&mut response, &config, origin.as_deref());
                 return Ok(response);
