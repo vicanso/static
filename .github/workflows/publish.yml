@@ -114,6 +114,7 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${{ env.IMAGE_NAME }}:${{ env.VERSION }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
             $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
       - name: Inspect image
         run: |
