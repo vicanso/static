@@ -19,7 +19,7 @@ jobs:
           - { arch: "linux/amd64", tag: "amd64", runs-on: "ubuntu-24.04" }
           - { arch: "linux/arm64", tag: "arm64", runs-on: "ubuntu-24.04-arm" }
         variant:
-          # default: force-compression=false → debian:bookworm-slim base layer
+          # default: force-compression=false → debian:trixie-slim base layer
           # keeps upstream gzip digest, globally reusable across debian images.
           - { name: "default", suffix: "", force_compression: "false" }
           # zstd: force-compression=true → every layer re-encoded to zstd

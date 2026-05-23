@@ -11,7 +11,7 @@ RUN curl -L https://github.com/vicanso/http-stat-rs/releases/latest/download/htt
 RUN cd /static \
     && make release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 EXPOSE 3000
 
