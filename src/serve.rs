@@ -25,9 +25,11 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
+use tokio::sync::Notify;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
@@ -286,6 +288,20 @@ fn get_static_cache(size: usize) -> &'static TinyUfo<String, FileInfoCache> {
     STATIC_CACHE.get_or_init(|| TinyUfo::new(size, size))
 }
 
+// Cache keys are encoding-aware: the same logical path is stored once per
+// negotiated Content-Encoding (identity uses an empty suffix). This lets
+// pre-compressed `.br`/`.zst`/`.gz` responses be cached safely — a key encodes
+// exactly which bytes/encoding it holds — and lets a hit skip the path
+// validation + `stat` + sibling-probe round-trips entirely. The separator is a
+// NUL byte, which never appears in a normal (url-decoded) path segment.
+fn encoding_cache_key(file: &str, encoding: &str) -> String {
+    let mut key = String::with_capacity(file.len() + 1 + encoding.len());
+    key.push_str(file);
+    key.push('\u{0}');
+    key.push_str(encoding);
+    key
+}
+
 fn get_file_from_cache(file: &String, cache_size: usize) -> Option<Arc<FileInfo>> {
     if let Some(info) = get_static_cache(cache_size).get(file)
         && info.expired_at
@@ -315,15 +331,141 @@ fn set_file_to_cache(file: &str, info: Arc<FileInfo>, cache_size: usize, cache_t
     );
 }
 
+// Single-flight coordination. A burst of concurrent cache misses for the same
+// logical request would each independently `stat`/`read` the backend; this
+// collapses them so exactly one (the "leader") loads while the rest ("followers")
+// share its result. The shared result is the immutable `Arc<FileInfo>` — for
+// streamed files (`body == None`) each follower still opens its own byte stream
+// from `read_file` in `static_serve`, so only the metadata load is deduplicated.
+struct Flight {
+    done: Notify,
+    result: Mutex<Option<Arc<FileInfo>>>,
+}
+
+impl Flight {
+    fn new() -> Self {
+        Self {
+            done: Notify::new(),
+            result: Mutex::new(None),
+        }
+    }
+    fn result(&self) -> Option<Arc<FileInfo>> {
+        self.result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    fn publish(&self, info: Arc<FileInfo>) {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(info);
+    }
+}
+
+static INFLIGHT: OnceLock<Mutex<HashMap<String, Arc<Flight>>>> = OnceLock::new();
+
+fn inflight() -> &'static Mutex<HashMap<String, Arc<Flight>>> {
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Two requests resolve to byte-identical responses iff they share the same
+// logical path, the same set of accepted compression encodings (negotiation is
+// purely a boolean per encoding), and the same HEAD-ness (HEAD has no body).
+// Those three inputs form the single-flight key. The separator is a NUL byte.
+fn singleflight_key(file: &str, prefs: &Option<EncodingPrefs>, head: bool) -> String {
+    let (br, zstd, gzip) = match prefs {
+        Some(p) => (p.accepts("br"), p.accepts("zstd"), p.accepts("gzip")),
+        None => (false, false, false),
+    };
+    format!(
+        "{file}\u{0}{}{}{}{}",
+        br as u8, zstd as u8, gzip as u8, head as u8
+    )
+}
+
 async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
-    let mut file = params.file.clone();
+    let file = params.file.clone();
+
+    // Parse Accept-Encoding once: reused for both the encoding-aware cache
+    // lookup below and pre-compressed sibling negotiation further down.
+    let accept_prefs = params.accept_encoding.as_deref().map(EncodingPrefs::parse);
+
+    // Encoding-aware cache lookup. Probe each encoding the client accepts in
+    // priority order (br > zstd > gzip), then identity. The first hit returns a
+    // fully built FileInfo (correct Content-Encoding + body) and skips the
+    // validate / `stat` / sibling-probe round-trips below. Probing a variant
+    // that was never cached is a cheap in-memory miss, so unsupported paths
+    // (e.g. HTML, which is never cached) simply fall through to the slow path.
     if params.cache_size > 0 {
-        if let Some(info) = get_file_from_cache(&file, params.cache_size) {
+        if let Some(prefs) = &accept_prefs {
+            for enc in ["br", "zstd", "gzip"] {
+                if prefs.accepts(enc)
+                    && let Some(info) =
+                        get_file_from_cache(&encoding_cache_key(&file, enc), params.cache_size)
+                {
+                    crate::metrics::record_cache_hit();
+                    return Ok(info);
+                }
+            }
+        }
+        if let Some(info) =
+            get_file_from_cache(&encoding_cache_key(&file, ""), params.cache_size)
+        {
             crate::metrics::record_cache_hit();
             return Ok(info);
         }
         crate::metrics::record_cache_miss();
     }
+
+    // Single-flight dispatch: become the leader for this key, or follow an
+    // already in-flight leader and share its result.
+    let sf_key = singleflight_key(&file, &accept_prefs, params.head);
+    let follow = {
+        let mut map = inflight().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&sf_key) {
+            Some(flight) => Some(flight.clone()),
+            None => {
+                map.insert(sf_key.clone(), Arc::new(Flight::new()));
+                None
+            }
+        }
+    };
+    if let Some(flight) = follow {
+        // Follower: register for the wake-up *before* checking the result so a
+        // notify firing in between is not lost, then await it. A missing/empty
+        // result (leader errored or produced an uncacheable response) falls
+        // through to an independent load. The miss was already counted above.
+        let notified = flight.done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(info) = flight.result() {
+            return Ok(info);
+        }
+        notified.await;
+        if let Some(info) = flight.result() {
+            return Ok(info);
+        }
+        return load_file(params, file, &accept_prefs).await;
+    }
+
+    // Leader: load, hand the result to any followers, then clear the slot.
+    let res = load_file(params, file, &accept_prefs).await;
+    if let Some(flight) = inflight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&sf_key)
+    {
+        if let Ok(info) = &res {
+            flight.publish(info.clone());
+        }
+        flight.done.notify_waiters();
+    }
+    res
+}
+
+async fn load_file(
+    params: &StaticServeParams,
+    mut file: String,
+    accept_prefs: &Option<EncodingPrefs>,
+) -> Result<Arc<FileInfo>> {
     let storage = get_storage()?;
     storage.validate(&file)?;
 
@@ -430,15 +572,15 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     if let Ok(v) = HeaderValue::try_from(content_type) {
         headers.push((header::CONTENT_TYPE, v));
     }
-    // Try pre-compressed file (.br / .gz) if enabled and client supports it
+    // Try pre-compressed file (.br / .zst / .gz) if enabled and client supports
+    // it. `negotiated_encoding` is the encoding actually served ("" = identity)
+    // and becomes the cache-key suffix below. Priority: brotli > zstd > gzip.
     let mut precompressed_file = None;
-    if let Some(accept_encoding) = params.accept_encoding.as_deref()
+    let mut negotiated_encoding: &'static str = "";
+    if let Some(prefs) = accept_prefs
         && !is_html
         && !is_dir
     {
-        // Parse the header once, then test each candidate against the parsed
-        // prefs. Priority: brotli > zstd > gzip.
-        let prefs = EncodingPrefs::parse(accept_encoding);
         let candidates: &[(&str, &str)] = &[("br", ".br"), ("zstd", ".zst"), ("gzip", ".gz")];
         for (encoding, ext) in candidates {
             if prefs.accepts(encoding) {
@@ -447,6 +589,7 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
                     precompressed_file = Some(compressed);
                     meta = compressed_meta;
                     headers.push((header::CONTENT_ENCODING, HeaderValue::from_static(encoding)));
+                    negotiated_encoding = encoding;
                     break;
                 }
             }
@@ -516,13 +659,14 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     } else {
         None
     };
-    // Pre-compressed responses are encoding-specific (e.g. `.br` bytes with
-    // `Content-Encoding: br`). The in-memory cache key is the logical path and
-    // is NOT encoding-aware, so caching them would serve the wrong encoding to
-    // a client that negotiated a different one. Only identity responses are
-    // safe to cache (any client can receive them; the global CompressionLayer
-    // still compresses on the way out per that client's Accept-Encoding).
-    let is_precompressed = precompressed_file.is_some();
+    // Cache under the encoding-aware key (`negotiated_encoding` is "" for
+    // identity, or the pre-compressed encoding). Because the key now encodes
+    // exactly which bytes it holds, pre-compressed responses are safe to cache
+    // — a differently-negotiating client probes a different key. Metadata-only
+    // entries (large/streamed files, `body == None`) are cached too: a hit then
+    // skips the `stat` + sibling probes and streams straight from `read_file`.
+    // HEAD requests are never cached (their body is always None even for small
+    // files, which would force a later GET onto the streaming path).
     let read_path = precompressed_file.unwrap_or_else(|| file.clone());
     let info = Arc::new(FileInfo {
         headers,
@@ -531,8 +675,9 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         read_file: read_path,
         last_modified_secs,
     });
-    if params.cache_size > 0 && !is_html && !is_precompressed && info.body.is_some() {
-        set_file_to_cache(&file, info.clone(), params.cache_size, params.cache_ttl);
+    if params.cache_size > 0 && !is_html && !params.head {
+        let key = encoding_cache_key(&file, negotiated_encoding);
+        set_file_to_cache(&key, info.clone(), params.cache_size, params.cache_ttl);
     }
 
     Ok(info)

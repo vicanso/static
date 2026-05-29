@@ -63,8 +63,9 @@ docker run -d --restart=always \
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `STATIC_COMPRESS_MIN_LENGTH` | `256` | 启用压缩的最小响应字节数 |
-| `STATIC_PRECOMPRESSED` | `false` | 当客户端支持对应编码时，直接返回 `.br` / `.zst` / `.gz` 副本（如 `app.js` 对应 `app.js.br`），跳过运行时压缩。协商遵循 `q` 值（`br;q=0` 视为明确拒绝）。 |
+| `STATIC_COMPRESS_MIN_LENGTH` | `256` | 启用压缩的最小响应字节数（设为 `0` 则完全关闭运行时压缩层） |
+| `STATIC_COMPRESS_LEVEL` | `default` | 运行时压缩质量：`fastest`、`best`、`default`，或用整数指定算法的精确级别。高流量的文本/JS/JSON 响应可用 `fastest` 降低 CPU；若想彻底免去运行时压缩，优先使用 `STATIC_PRECOMPRESSED`。 |
+| `STATIC_PRECOMPRESSED` | `false` | 当客户端支持对应编码时，直接返回 `.br` / `.zst` / `.gz` 副本（如 `app.js` 对应 `app.js.br`），跳过运行时压缩。协商遵循 `q` 值（`br;q=0` 视为明确拒绝）。协商出的响应会按编码分别缓存，重复命中直接走内存。 |
 
 ### 路由与回退
 
@@ -115,6 +116,7 @@ docker run -d --restart=always \
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `STATIC_READ_MAX_SIZE` | `250KB` | 直接读入内存的最大文件大小，超过则流式传输。支持可读格式（`30KB`、`1MB`）。 |
+| `STATIC_DISABLE_SYMLINK_CHECK` | `false` | 仅本地文件系统。跳过每次请求中用于拦截符号链接逃逸根目录的 `canonicalize()` 系统调用；词法层面的 `../` 穿越防护始终生效。仅在确认资源目录不含符号链接时启用，以在缓存未命中时省去该系统调用。 |
 | `STATIC_ACCESS_LOG` | `true` | 启用访问日志 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` |
 | `LOG_FORMAT` | `text` | 日志输出格式：`text` 或 `json` |

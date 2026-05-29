@@ -63,8 +63,9 @@ Every option is set via an environment variable and parsed once at startup.
 
 | Variable | Default | Description |
 |---|---|---|
-| `STATIC_COMPRESS_MIN_LENGTH` | `256` | Minimum response size in bytes to compress |
-| `STATIC_PRECOMPRESSED` | `false` | Serve `.br` / `.zst` / `.gz` siblings (e.g. `app.js.br` for `app.js`) when the client supports the encoding, skipping runtime compression. Negotiation is `q`-value aware (a `br;q=0` is honored as a refusal). |
+| `STATIC_COMPRESS_MIN_LENGTH` | `256` | Minimum response size in bytes to compress (`0` disables the runtime compression layer entirely) |
+| `STATIC_COMPRESS_LEVEL` | `default` | Runtime compression quality: `fastest`, `best`, `default`, or an integer for a precise per-algorithm level. Use `fastest` to cut CPU on high-traffic text/JS/JSON responses; prefer `STATIC_PRECOMPRESSED` to avoid runtime compression altogether. |
+| `STATIC_PRECOMPRESSED` | `false` | Serve `.br` / `.zst` / `.gz` siblings (e.g. `app.js.br` for `app.js`) when the client supports the encoding, skipping runtime compression. Negotiation is `q`-value aware (a `br;q=0` is honored as a refusal). Negotiated responses are cached per-encoding, so a repeat hit serves straight from memory. |
 
 ### Routing & Fallback
 
@@ -115,6 +116,7 @@ Every option is set via an environment variable and parsed once at startup.
 | Variable | Default | Description |
 |---|---|---|
 | `STATIC_READ_MAX_SIZE` | `250KB` | Max file size buffered in memory; larger files are streamed. Accepts human-readable sizes (`30KB`, `1MB`). |
+| `STATIC_DISABLE_SYMLINK_CHECK` | `false` | Local FS only. Skip the per-request `canonicalize()` syscall that blocks symlinks escaping the root. Lexical `../` traversal protection stays on regardless. Enable only when the asset tree is known to be symlink-free, to save the syscall on cache misses. |
 | `STATIC_ACCESS_LOG` | `true` | Enable access logging |
 | `LOG_LEVEL` | `INFO` | Log level: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `LOG_FORMAT` | `text` | Log output format: `text` or `json` |

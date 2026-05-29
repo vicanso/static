@@ -7,6 +7,17 @@ edition = "2024"
 # Set the unwrap_used lint level to deny
 unwrap_used = "deny"
 
+[features]
+# All cloud/network backends are on by default so `cargo build --release`
+# preserves the historical "all backends compiled in" behavior. Build with
+# `--no-default-features` (optionally re-enabling individual backends, e.g.
+# `--features s3`) to strip out MongoDB/AWS SDK/FTP for a much smaller binary
+# when only local-filesystem serving is needed. The fs backend is always on.
+default = ["s3", "ftp", "gridfs"]
+s3 = ["opendal/services-s3"]
+ftp = ["opendal/services-ftp"]
+gridfs = ["opendal/services-gridfs"]
+
 [dependencies]
 TinyUFO = "0.8.0"
 aho-corasick = "1.1.4"
@@ -24,9 +35,6 @@ mimalloc = "0.1.51"
 num_cpus = "1.17.0"
 opendal = { version = "0.56.0", features = [
     "services-fs",
-    "services-ftp",
-    "services-gridfs",
-    "services-s3",
     "layers-mime-guess",
 ] }
 path-absolutize = "3.1.1"

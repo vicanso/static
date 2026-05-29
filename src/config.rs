@@ -20,12 +20,14 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tower_http::compression::CompressionLevel;
 use tracing::{error, warn};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub timeout: Duration,
     pub compress_min_length: u16,
+    pub compress_level: CompressionLevel,
     pub index_file: Arc<str>,
     pub autoindex: bool,
     pub listen_addr: String,
@@ -71,6 +73,26 @@ fn parse_duration_or_exit(name: &str, raw: Option<&str>, default: Duration) -> D
     }
 }
 
+// Parse the compression quality level from env. Absent -> algorithm default;
+// `fastest`/`best`/`default` map to the named levels, any integer to a precise
+// level (clamped per-algorithm by tower-http); anything else -> log and exit.
+fn parse_compress_level_or_exit(raw: Option<&str>) -> CompressionLevel {
+    match raw {
+        None => CompressionLevel::Default,
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "fastest" => CompressionLevel::Fastest,
+            "best" => CompressionLevel::Best,
+            "default" => CompressionLevel::Default,
+            other => other.parse::<i32>().map(CompressionLevel::Precise).unwrap_or_else(|_| {
+                error!(
+                    "Invalid STATIC_COMPRESS_LEVEL={s}: expected fastest|best|default|<integer>"
+                );
+                std::process::exit(1)
+            }),
+        },
+    }
+}
+
 // Parse an optional byte size from env. Absent -> default;
 // present but invalid -> log and exit.
 fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
@@ -91,6 +113,7 @@ fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
 struct EnvConfig {
     timeout: Option<String>,
     compress_min_length: u16,
+    compress_level: Option<String>,
     index_file: String,
     autoindex: bool,
     listen_addr: String,
@@ -123,6 +146,7 @@ impl Default for EnvConfig {
         Self {
             timeout: None,
             compress_min_length: 256,
+            compress_level: None,
             index_file: "index.html".to_string(),
             autoindex: false,
             listen_addr: "0.0.0.0:3000".to_string(),
@@ -238,6 +262,7 @@ impl Config {
                 Duration::from_secs(30),
             ),
             compress_min_length: env_cfg.compress_min_length,
+            compress_level: parse_compress_level_or_exit(env_cfg.compress_level.as_deref()),
             index_file: env_cfg.index_file.into(),
             autoindex: env_cfg.autoindex,
             listen_addr: env_cfg.listen_addr,

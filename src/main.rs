@@ -137,7 +137,11 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
         let predicate = SizeAbove::new(size).and(Compressible);
         app.layer(
             builder
-                .layer(CompressionLayer::new().compress_when(predicate))
+                .layer(
+                    CompressionLayer::new()
+                        .quality(config.compress_level)
+                        .compress_when(predicate),
+                )
                 .timeout(config.timeout),
         )
     } else {
