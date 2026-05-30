@@ -113,7 +113,7 @@ Every option is set via an environment variable and parsed once at startup.
 
 | Variable | Default | Description |
 |---|---|---|
-| `STATIC_METRICS` | `true` | Expose Prometheus counters at `GET /metrics`. See [Metrics](#metrics). |
+| `STATIC_METRICS` | `true` | Expose Prometheus metrics at `GET /metrics`; `false` also disables per-request collection (zero overhead). See [Metrics](#metrics). |
 
 ### I/O & Logging
 
@@ -260,7 +260,7 @@ STATIC_CORS_ALLOW_CREDENTIALS=true
 
 ## Metrics
 
-When `STATIC_METRICS` is `true` (the default), `GET /metrics` returns Prometheus-format counters: total requests, responses by status class, total response bytes, and in-memory cache hits / misses. Like `/health`, it bypasses Basic Auth and IP access control — restrict it at the proxy if exposure is a concern, or set `STATIC_METRICS=false` to remove the route entirely.
+When `STATIC_METRICS` is `true` (the default), `GET /metrics` returns Prometheus-format metrics: total requests, responses by status class, total response bytes, in-memory cache hits / misses, a `static_serve_request_duration_seconds` latency **histogram** (time to produce the response), and `static_serve_cache_entries` / `static_serve_cache_capacity` **gauges** for current cache occupancy and configured capacity (their ratio is the fill level). Like `/health`, it bypasses Basic Auth and IP access control — restrict it at the proxy if exposure is a concern, or set `STATIC_METRICS=false` to remove the route entirely. Collection overhead is negligible for normal workloads (a few atomic counters and two clock reads per request); `STATIC_METRICS=false` skips that recording as well, so disabling metrics is genuinely free on the hot path.
 
 ## Storage Backends
 

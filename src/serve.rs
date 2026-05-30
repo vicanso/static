@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use crate::metrics;
 use crate::storage::get_storage;
 use aho_corasick::AhoCorasick;
 use axum::body::Body;
@@ -323,14 +324,23 @@ fn set_file_to_cache(file: &str, info: Arc<FileInfo>, cache_size: usize, cache_t
         .unwrap_or_default()
         .as_secs()
         + cache_ttl.as_secs();
-    get_static_cache(cache_size).put(
-        file.to_string(),
+    let cache = get_static_cache(cache_size);
+    let key = file.to_string();
+    // Is this a physically new key, or a re-cache of a still-present but
+    // logically-expired entry? The occupancy gauge counts distinct entries, so
+    // only a genuinely new key adds one. `put` returns the entries it evicted to
+    // make room; subtract those. The pre-`put` lookup exists solely to feed the
+    // gauge, so skip it when metrics are off (short-circuits before the `get`).
+    let is_new = metrics::enabled() && cache.get(&key).is_none();
+    let evicted = cache.put(
+        key,
         FileInfoCache {
             expired_at,
             data: info,
         },
         1,
     );
+    metrics::record_cache_insert(is_new, evicted.len());
 }
 
 // Single-flight coordination. A burst of concurrent cache misses for the same
@@ -403,16 +413,16 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
                     && let Some(info) =
                         get_file_from_cache(&encoding_cache_key(&file, enc), params.cache_size)
                 {
-                    crate::metrics::record_cache_hit();
+                    metrics::record_cache_hit();
                     return Ok(info);
                 }
             }
         }
         if let Some(info) = get_file_from_cache(&encoding_cache_key(&file, ""), params.cache_size) {
-            crate::metrics::record_cache_hit();
+            metrics::record_cache_hit();
             return Ok(info);
         }
-        crate::metrics::record_cache_miss();
+        metrics::record_cache_miss();
     }
 
     // Single-flight dispatch: become the leader for this key, or follow an

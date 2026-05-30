@@ -247,14 +247,20 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
 // internal `x-original-size` header (used only by access_log / metrics to know
 // the pre-compression body size) so it is never exposed to clients.
 async fn track_metrics(req: Request<Body>, next: Next) -> Response {
+    // Only time the request when metrics are on — when off, skip the two clock
+    // reads and the recording entirely. The header strip below always runs: it
+    // is an internal marker that must never reach the client regardless.
+    let start = metrics::enabled().then(Instant::now);
     let mut response = next.run(req).await;
-    let bytes = response
-        .headers()
-        .get(X_ORIGINAL_SIZE_HEADER_NAME.as_str())
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    metrics::record_request(response.status().as_u16(), bytes);
+    if let Some(start) = start {
+        let bytes = response
+            .headers()
+            .get(X_ORIGINAL_SIZE_HEADER_NAME.as_str())
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        metrics::record_request(response.status().as_u16(), bytes, start.elapsed());
+    }
     response
         .headers_mut()
         .remove(X_ORIGINAL_SIZE_HEADER_NAME.as_str());
@@ -606,6 +612,8 @@ fn main() {
     let config = Arc::new(Config::new());
     init_error_template(config.error_page.as_deref());
     rate_limit::init(config.rate_limit, config.rate_limit_burst);
+    metrics::set_enabled(config.metrics_enabled);
+    metrics::set_cache_capacity(config.cache_size);
     info!(
         config = ?config,
         "starting static server",

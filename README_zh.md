@@ -113,7 +113,7 @@ docker run -d --restart=always \
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `STATIC_METRICS` | `true` | 在 `GET /metrics` 暴露 Prometheus 计数器。见[指标](#指标)。 |
+| `STATIC_METRICS` | `true` | 在 `GET /metrics` 暴露 Prometheus 指标；设为 `false` 同时关闭逐请求采集（零开销）。见[指标](#指标)。 |
 
 ### I/O 与日志
 
@@ -260,7 +260,7 @@ STATIC_CORS_ALLOW_CREDENTIALS=true
 
 ## 指标
 
-当 `STATIC_METRICS` 为 `true`（默认）时，`GET /metrics` 返回 Prometheus 格式的计数器：请求总数、按状态码类别的响应数、响应字节总数，以及内存缓存命中/未命中。与 `/health` 一样，它绕过 Basic Auth 与 IP 访问控制——如有暴露顾虑请在前置代理处限制，或设置 `STATIC_METRICS=false` 彻底移除该路由。
+当 `STATIC_METRICS` 为 `true`（默认）时，`GET /metrics` 返回 Prometheus 格式的指标：请求总数、按状态码类别的响应数、响应字节总数、内存缓存命中/未命中、`static_serve_request_duration_seconds` 延迟**直方图**（生成响应所需时间），以及表示当前缓存条目数与配置容量的 `static_serve_cache_entries` / `static_serve_cache_capacity` **gauge**（两者之比即填充率）。与 `/health` 一样，它绕过 Basic Auth 与 IP 访问控制——如有暴露顾虑请在前置代理处限制，或设置 `STATIC_METRICS=false` 彻底移除该路由。采集开销对正常负载可忽略（每请求仅几个原子计数器与两次时钟读取）；`STATIC_METRICS=false` 同时跳过这部分记录，因此关闭指标在热路径上是真正零开销的。
 
 ## 存储后端
 
