@@ -48,7 +48,7 @@ docker run -d --restart=always \
 | `STATIC_LISTEN_ADDR` | `0.0.0.0:3000` | 监听地址 |
 | `STATIC_THREADS` | CPU 核心数 | tokio 工作线程数 |
 | `STATIC_TIMEOUT` | `30s` | 请求超时时间 |
-| `STATIC_SHUTDOWN_DELAY` | `5s` | SIGTERM 排空窗口：关闭前 `/health` 持续返回 500 的时长 |
+| `STATIC_SHUTDOWN_DELAY` | `5s` | SIGTERM 排空窗口：关闭前 `/health` 持续返回 503 的时长 |
 
 ### 缓存
 
@@ -234,7 +234,7 @@ STATIC_CACHE_CONTROL_EXT_JSON=public, max-age=300
 
 ## 健康检查
 
-`GET /health` 在服务正常运行时返回 `200 healthy`，收到 SIGTERM 信号后返回 `500 unhealthy`——提供一个排空窗口（默认 `5s`，通过 `STATIC_SHUTDOWN_DELAY` 设置）让负载均衡器在退出前摘除该实例。
+`GET /health` 在服务正常运行时返回 `200 healthy`，收到 SIGTERM 信号后返回 `503 unhealthy`——提供一个排空窗口（默认 `5s`，通过 `STATIC_SHUTDOWN_DELAY` 设置）让负载均衡器在退出前摘除该实例。此处使用 `503 Service Unavailable`（而非 `500`），以便负载均衡器将其视为临时排空，且多数告警不会触发。
 
 ## CORS
 

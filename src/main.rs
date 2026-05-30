@@ -104,10 +104,12 @@ async fn shutdown_signal(delay: Duration) {
             .expect("failed to install signal handler")
             .recv()
             .await;
-        info!("SIGTERM received, health check will return 500");
+        info!("SIGTERM received, health check will return 503");
         HEALTH_CHECK_RUNNING.store(false, Ordering::Relaxed);
         // Drain window: keep serving in-flight requests while /health reports
-        // 500 so the load balancer can deregister this instance.
+        // 503 (Service Unavailable — "temporarily down", which load balancers
+        // treat as deregister-and-retry rather than the alert-worthy 500) so the
+        // load balancer can deregister this instance.
         tokio::time::sleep(delay).await;
     };
 
@@ -567,7 +569,7 @@ async fn health_check() -> (StatusCode, &'static str) {
     if HEALTH_CHECK_RUNNING.load(Ordering::Relaxed) {
         (StatusCode::OK, "healthy")
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, "unhealthy")
+        (StatusCode::SERVICE_UNAVAILABLE, "unhealthy")
     }
 }
 

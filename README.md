@@ -48,7 +48,7 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_LISTEN_ADDR` | `0.0.0.0:3000` | Listen address |
 | `STATIC_THREADS` | num CPUs | Tokio worker threads |
 | `STATIC_TIMEOUT` | `30s` | Request timeout |
-| `STATIC_SHUTDOWN_DELAY` | `5s` | SIGTERM drain window: `/health` returns 500 for this long before shutdown |
+| `STATIC_SHUTDOWN_DELAY` | `5s` | SIGTERM drain window: `/health` returns 503 for this long before shutdown |
 
 ### Caching
 
@@ -234,7 +234,7 @@ Internal error detail (e.g. raw storage errors) is never shown to clients — it
 
 ## Health Check
 
-`GET /health` returns `200 healthy` while the server is running, and `500 unhealthy` after a SIGTERM is received — a drain window (default `5s`, set via `STATIC_SHUTDOWN_DELAY`) that lets the load balancer deregister this instance before shutdown.
+`GET /health` returns `200 healthy` while the server is running, and `503 unhealthy` after a SIGTERM is received — a drain window (default `5s`, set via `STATIC_SHUTDOWN_DELAY`) that lets the load balancer deregister this instance before shutdown. `503 Service Unavailable` is used (rather than `500`) so balancers read it as a temporary drain and most alerting does not fire.
 
 ## CORS
 
