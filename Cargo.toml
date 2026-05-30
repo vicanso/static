@@ -1,6 +1,6 @@
 [package]
 name = "static-serve"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2024"
 
 [lints.clippy]
@@ -31,7 +31,7 @@ httpdate = "1.0"
 ipnet = "2.12.0"
 humantime = "2.3.0"
 mime_guess = "2.0.5"
-mimalloc = "0.1.51"
+mimalloc = "0.1.52"
 num_cpus = "1.17.0"
 opendal = { version = "0.56.0", features = [
     "services-fs",
