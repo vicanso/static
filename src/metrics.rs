@@ -89,14 +89,17 @@ pub fn record_request(status: u16, bytes: u64, elapsed: Duration) {
 
 fn observe_latency(elapsed: Duration) {
     LATENCY_SUM_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-    let secs = elapsed.as_secs_f64();
-    // First bucket whose upper bound covers this observation; falls through to
-    // the final overflow (`+Inf`) slot when it exceeds every finite bound.
-    let slot = LATENCY_BUCKETS_SECONDS
+    LATENCY_BUCKET_COUNTS[latency_slot(elapsed.as_secs_f64())].fetch_add(1, Ordering::Relaxed);
+}
+
+// Index of the histogram slot for a latency in seconds: the first bucket whose
+// upper bound covers it, or the final overflow (`+Inf`) slot at index
+// `LATENCY_BUCKETS_SECONDS.len()` when it exceeds every finite bound.
+fn latency_slot(secs: f64) -> usize {
+    LATENCY_BUCKETS_SECONDS
         .iter()
         .position(|&bound| secs <= bound)
-        .unwrap_or(LATENCY_BUCKETS_SECONDS.len());
-    LATENCY_BUCKET_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+        .unwrap_or(LATENCY_BUCKETS_SECONDS.len())
 }
 
 pub fn record_cache_hit() {
@@ -214,4 +217,20 @@ pub fn render() -> String {
          static_serve_request_duration_seconds_count {cumulative}"
     );
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_slot_picks_first_covering_bucket() {
+        // bounds: [0.001, 0.005, ..., 10.0] — 12 finite buckets, overflow = 12.
+        assert_eq!(latency_slot(0.0), 0);
+        assert_eq!(latency_slot(0.001), 0); // exactly the first bound (le is inclusive)
+        assert_eq!(latency_slot(0.0011), 1); // just over the first bound
+        assert_eq!(latency_slot(0.05), 4); // exactly a mid bound
+        assert_eq!(latency_slot(10.0), 11); // exactly the last finite bound
+        assert_eq!(latency_slot(11.0), LATENCY_BUCKETS_SECONDS.len()); // overflow (+Inf)
+    }
 }

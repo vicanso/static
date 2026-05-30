@@ -16,7 +16,7 @@ make release  # cargo build --release  (LTO/strip/panic=abort come from Cargo.to
 make bloat    # cargo bloat --release
 ```
 
-There is currently **no test suite** (no `#[test]`, no `tests/`); `cargo test` is a no-op. Once tests exist, run one with `cargo test <name>`.
+Unit tests live in-module under `#[cfg(test)] mod tests` in `serve.rs`, `metrics.rs`, and `rate_limit.rs` (pure logic: range parsing, `Accept-Encoding` negotiation, `If-Range`, cache-key formatting, latency bucketing, the token-bucket math). Run all with `cargo test`, or one with `cargo test <name>`. There is no `tests/` integration dir yet. `unwrap_used = "deny"` applies to test code too, so tests use `assert!`/`assert_eq!`/`matches!` and infallible constructors rather than `.unwrap()`; the rate limiter exposes a private time-injectable `check_at(ip, now)` so its refill math is tested deterministically without a real clock.
 
 `make lint` is the gate that matters and must pass. Beyond `--deny=warnings`, `Cargo.toml` sets `[lints.clippy] unwrap_used = "deny"` — **do not use `.unwrap()`**; propagate via the `Error` type / `Result`. Run `cargo clippy` (or `make lint`) before considering any change done.
 

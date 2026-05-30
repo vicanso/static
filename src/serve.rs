@@ -695,12 +695,13 @@ async fn load_file(
 // (inclusive, clamped to the representation) in request order: a single entry
 // yields a `206` with `Content-Range`, multiple entries a `multipart/byteranges`
 // body.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RangesValue {
     NotSatisfiable,
     Ranges(Vec<(u64, u64)>),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum OneRange {
     Satisfiable(u64, u64),
     Unsatisfiable,
@@ -1052,4 +1053,153 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
     );
 
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_one_range_forms() {
+        // explicit, suffix, and open-ended forms against a 1000-byte resource
+        assert_eq!(
+            parse_one_range("0-99", 1000),
+            Some(OneRange::Satisfiable(0, 99))
+        );
+        assert_eq!(
+            parse_one_range("500-", 1000),
+            Some(OneRange::Satisfiable(500, 999))
+        );
+        assert_eq!(
+            parse_one_range("-500", 1000),
+            Some(OneRange::Satisfiable(500, 999))
+        );
+        // suffix longer than the resource clamps to the whole body
+        assert_eq!(
+            parse_one_range("-2000", 1000),
+            Some(OneRange::Satisfiable(0, 999))
+        );
+        // end past EOF clamps to the last byte
+        assert_eq!(
+            parse_one_range("900-5000", 1000),
+            Some(OneRange::Satisfiable(900, 999))
+        );
+        // whitespace around the spec is tolerated
+        assert_eq!(
+            parse_one_range(" 0-9 ", 1000),
+            Some(OneRange::Satisfiable(0, 9))
+        );
+    }
+
+    #[test]
+    fn parse_one_range_unsatisfiable_and_malformed() {
+        // start at/after EOF, or a zero-length suffix, is unsatisfiable
+        assert_eq!(
+            parse_one_range("1000-", 1000),
+            Some(OneRange::Unsatisfiable)
+        );
+        assert_eq!(parse_one_range("-0", 1000), Some(OneRange::Unsatisfiable));
+        // any range against a zero-length resource is unsatisfiable
+        assert_eq!(parse_one_range("0-0", 0), Some(OneRange::Unsatisfiable));
+        // start > end, missing dash, or non-numeric is malformed (None)
+        assert_eq!(parse_one_range("100-50", 1000), None);
+        assert_eq!(parse_one_range("abc", 1000), None);
+        assert_eq!(parse_one_range("1-x", 1000), None);
+    }
+
+    #[test]
+    fn parse_ranges_single_and_multi() {
+        assert_eq!(
+            parse_ranges("bytes=0-99", 1000),
+            Some(RangesValue::Ranges(vec![(0, 99)]))
+        );
+        assert_eq!(
+            parse_ranges("bytes=0-99,200-299", 1000),
+            Some(RangesValue::Ranges(vec![(0, 99), (200, 299)]))
+        );
+        // a trailing/empty spec is skipped, not treated as malformed
+        assert_eq!(
+            parse_ranges("bytes=0-0,", 1000),
+            Some(RangesValue::Ranges(vec![(0, 0)]))
+        );
+    }
+
+    #[test]
+    fn parse_ranges_mixed_satisfiability() {
+        // an unsatisfiable member of an otherwise-satisfiable set is dropped
+        assert_eq!(
+            parse_ranges("bytes=0-99,5000-6000", 1000),
+            Some(RangesValue::Ranges(vec![(0, 99)]))
+        );
+        // every member unsatisfiable -> 416
+        assert_eq!(
+            parse_ranges("bytes=5000-6000", 1000),
+            Some(RangesValue::NotSatisfiable)
+        );
+    }
+
+    #[test]
+    fn parse_ranges_rejected_inputs() {
+        // wrong unit, or any malformed member, ignores the whole header (full 200)
+        assert_eq!(parse_ranges("items=0-99", 1000), None);
+        assert_eq!(parse_ranges("bytes=0-99,100-50", 1000), None);
+        // more than MAX_RANGES ranges -> ignore the header entirely
+        let many = (0..MAX_RANGES + 1)
+            .map(|_| "0-0")
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(parse_ranges(&format!("bytes={many}"), 1000), None);
+    }
+
+    #[test]
+    fn encoding_prefs_negotiation() {
+        let prefs = EncodingPrefs::parse("br, gzip");
+        assert!(prefs.accepts("br"));
+        assert!(prefs.accepts("gzip"));
+        assert!(!prefs.accepts("zstd"));
+
+        // q=0 is an explicit refusal, even with a wildcard present
+        let prefs = EncodingPrefs::parse("br;q=0, *");
+        assert!(!prefs.accepts("br"));
+        assert!(prefs.accepts("zstd")); // inherits the wildcard
+
+        // encoding names are case-insensitive
+        assert!(EncodingPrefs::parse("BR").accepts("br"));
+        // a positive q-value still accepts
+        assert!(EncodingPrefs::parse("gzip;q=0.5").accepts("gzip"));
+        // a refused wildcard accepts nothing unmentioned
+        assert!(!EncodingPrefs::parse("*;q=0").accepts("br"));
+    }
+
+    #[test]
+    fn if_range_strong_validators_only() {
+        // strong ETag match honors the range
+        assert!(if_range_satisfied("\"abc\"", Some("\"abc\""), None));
+        // mismatch, weak request validator, or weak stored ETag all reject
+        assert!(!if_range_satisfied("\"abc\"", Some("\"xyz\""), None));
+        assert!(!if_range_satisfied("W/\"abc\"", Some("\"abc\""), None));
+        assert!(!if_range_satisfied("\"abc\"", Some("W/\"abc\""), None));
+
+        // date validator: honored only when the resource is not newer than the date
+        let date_after = fmt_http_date(UNIX_EPOCH + Duration::from_secs(2000));
+        assert!(if_range_satisfied(&date_after, None, Some(1000)));
+        let date_before = fmt_http_date(UNIX_EPOCH + Duration::from_secs(500));
+        assert!(!if_range_satisfied(&date_before, None, Some(1000)));
+    }
+
+    #[test]
+    fn encoding_cache_key_is_nul_separated() {
+        assert_eq!(encoding_cache_key("a/b.js", "br"), "a/b.js\u{0}br");
+        assert_eq!(encoding_cache_key("x", ""), "x\u{0}");
+    }
+
+    #[test]
+    fn html_escape_covers_dangerous_chars() {
+        assert_eq!(
+            html_escape("<a href=\"x\">&'"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#x27;"
+        );
+        // benign text is unchanged
+        assert_eq!(html_escape("plain.txt"), "plain.txt");
+    }
 }

@@ -68,7 +68,12 @@ impl RateLimiter {
     // `rate` is guaranteed > 0 here (a 0 rate disables the limiter entirely in
     // `init`), so the division is safe.
     fn check(&self, ip: IpAddr) -> std::result::Result<(), u64> {
-        let now = Instant::now();
+        self.check_at(ip, Instant::now())
+    }
+
+    // The body of `check`, with `now` injected so the refill/burst/retry-after
+    // math is testable without a real clock.
+    fn check_at(&self, ip: IpAddr, now: Instant) -> std::result::Result<(), u64> {
         let rate = self.rate;
         let cap = self.capacity;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -123,5 +128,61 @@ pub fn check(ip: IpAddr) -> Option<u64> {
     match LIMITER.get() {
         Some(Some(limiter)) => limiter.check(ip).err(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))
+    }
+
+    #[test]
+    fn allows_burst_then_limits() {
+        let rl = RateLimiter::new(1, 3); // 1 req/s sustained, burst of 3
+        let t0 = Instant::now();
+        // the full burst passes at the same instant
+        assert!(rl.check_at(ip(1), t0).is_ok());
+        assert!(rl.check_at(ip(1), t0).is_ok());
+        assert!(rl.check_at(ip(1), t0).is_ok());
+        // the next is rejected, asking the client to retry in ~1s
+        assert_eq!(rl.check_at(ip(1), t0), Err(1));
+    }
+
+    #[test]
+    fn refills_over_time() {
+        let rl = RateLimiter::new(2, 2); // 2 req/s, burst of 2
+        let t0 = Instant::now();
+        assert!(rl.check_at(ip(1), t0).is_ok());
+        assert!(rl.check_at(ip(1), t0).is_ok());
+        assert!(rl.check_at(ip(1), t0).is_err()); // bucket empty
+        // one second later the bucket has refilled by 2 tokens
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(rl.check_at(ip(1), t1).is_ok());
+        assert!(rl.check_at(ip(1), t1).is_ok());
+        assert!(rl.check_at(ip(1), t1).is_err());
+    }
+
+    #[test]
+    fn buckets_are_per_ip() {
+        let rl = RateLimiter::new(1, 1);
+        let t0 = Instant::now();
+        assert!(rl.check_at(ip(1), t0).is_ok());
+        assert!(rl.check_at(ip(1), t0).is_err()); // ip 1 exhausted
+        assert!(rl.check_at(ip(2), t0).is_ok()); // ip 2 is independent
+    }
+
+    #[test]
+    fn burst_zero_clamps_to_one() {
+        // `RateLimiter::new` clamps a 0 burst to a 1-token bucket as a backstop
+        // (the 0 -> rate resolution lives in `init`). One request passes, the
+        // next is limited.
+        let rl = RateLimiter::new(5, 0);
+        let t0 = Instant::now();
+        assert!(rl.check_at(ip(1), t0).is_ok());
+        assert!(rl.check_at(ip(1), t0).is_err());
     }
 }
