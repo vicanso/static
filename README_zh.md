@@ -19,6 +19,7 @@
 - CORS 支持，含预检（preflight）处理
 - SPA 回退模式
 - Basic Auth 与 IP 黑白名单
+- 基于 IP 的限流（令牌桶），增强抗 DoS 能力
 - URL 重定向规则
 - SIGTERM 优雅关闭，排空窗口可配置
 - 访问日志（文本或 JSON）与 Prometheus `/metrics` 端点
@@ -85,6 +86,9 @@ docker run -d --restart=always \
 | `STATIC_BASIC_AUTH_REALM` | `static` | `WWW-Authenticate` 头中的 realm 字符串 |
 | `STATIC_IP_ALLOWLIST` | — | 逗号分隔的允许 IP / CIDR。见[IP 访问控制](#ip-访问控制)。 |
 | `STATIC_IP_BLOCKLIST` | — | 逗号分隔的阻止 IP / CIDR（优先于白名单检查） |
+| `STATIC_RATE_LIMIT` | `0` | 每个 IP 的限流速率（请求/秒，`0` 表示关闭）。见[限流](#限流)。 |
+| `STATIC_RATE_LIMIT_BURST` | — | 令牌桶突发容量（默认等于 `STATIC_RATE_LIMIT`） |
+| `STATIC_RATE_LIMIT_EXEMPT` | — | 逗号分隔的免限流 IP / CIDR |
 
 ### 内容与响应头
 
@@ -156,6 +160,23 @@ STATIC_IP_ALLOWLIST=192.168.0.0/16
 ```
 
 被拒绝的请求收到 `403`。`/health` 端点始终绕过 IP 访问控制。
+
+## 限流
+
+通过基于 IP 的[令牌桶](https://zh.wikipedia.org/wiki/%E4%BB%A4%E7%89%8C%E6%A1%B6)防御突发流量与 DoS。该功能**默认关闭**；将 `STATIC_RATE_LIMIT` 设置为每个客户端 IP 允许的持续请求速率（请求/秒）。`STATIC_RATE_LIMIT_BURST` 为令牌桶容量——即在回落到持续速率前可一次性涌入的请求数——未设置时默认等于 `STATIC_RATE_LIMIT`。
+
+```bash
+# 每个 IP 允许 50 请求/秒，可容忍最多 100 的短时突发
+STATIC_RATE_LIMIT=50
+STATIC_RATE_LIMIT_BURST=100
+
+# 豁免可信网段（内部服务、监控）不受限流
+STATIC_RATE_LIMIT_EXEMPT=10.0.0.0/8,192.168.0.0/16,127.0.0.1
+```
+
+客户端 IP 的解析方式与 IP 访问控制一致（依次为 `X-Forwarded-For`、`X-Real-IP`、连接地址），因此若非直接终结连接，请将服务部署在会设置这些头的可信代理之后。超过限制的请求收到带 `Retry-After` 头（秒）的 `429 Too Many Requests`。限流在 IP 访问控制之后执行，且 `/health` 与 `/metrics` 路由完全绕过限流。
+
+IP 匹配 `STATIC_RATE_LIMIT_EXEMPT`（单个 IP 或 CIDR 网段，支持 IPv4/IPv6）的客户端将跳过限流——适用于内部网络、健康检查器或不应被限流的可信上游。
 
 ## 重定向规则
 

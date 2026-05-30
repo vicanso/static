@@ -40,6 +40,13 @@ pub struct Config {
     pub redirects: Arc<Vec<(String, u16, String)>>,
     pub ip_allowlist: Arc<Vec<IpNet>>,
     pub ip_blocklist: Arc<Vec<IpNet>>,
+    // Per-IP token-bucket rate limit. `rate_limit` is sustained requests/sec
+    // per client IP (0 = disabled); `rate_limit_burst` is the bucket capacity
+    // (0 = use `rate_limit`). `rate_limit_exempt` is a list of IPs / CIDRs that
+    // bypass the limiter entirely (e.g. trusted internal networks, monitors).
+    pub rate_limit: u32,
+    pub rate_limit_burst: u32,
+    pub rate_limit_exempt: Arc<Vec<IpNet>>,
     pub basic_auth: Arc<HashSet<String>>,
     pub basic_auth_realm: String,
     pub error_page: Option<String>,
@@ -132,6 +139,9 @@ struct EnvConfig {
     threads: usize,
     ip_allowlist: String,
     ip_blocklist: String,
+    rate_limit: u32,
+    rate_limit_burst: u32,
+    rate_limit_exempt: String,
     basic_auth_realm: String,
     error_page: Option<String>,
     content_type_nosniff: bool,
@@ -165,6 +175,9 @@ impl Default for EnvConfig {
             threads: num_cpus::get(),
             ip_allowlist: String::new(),
             ip_blocklist: String::new(),
+            rate_limit: 0,
+            rate_limit_burst: 0,
+            rate_limit_exempt: String::new(),
             basic_auth_realm: "static".to_string(),
             error_page: None,
             content_type_nosniff: true,
@@ -291,6 +304,9 @@ impl Config {
             redirects: Arc::new(redirects),
             ip_allowlist: Arc::new(parse_ip_list(&env_cfg.ip_allowlist)),
             ip_blocklist: Arc::new(parse_ip_list(&env_cfg.ip_blocklist)),
+            rate_limit: env_cfg.rate_limit,
+            rate_limit_burst: env_cfg.rate_limit_burst,
+            rate_limit_exempt: Arc::new(parse_ip_list(&env_cfg.rate_limit_exempt)),
             basic_auth: Arc::new(basic_auth),
             basic_auth_realm: env_cfg.basic_auth_realm,
             error_page: env_cfg.error_page,

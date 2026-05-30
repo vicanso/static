@@ -19,6 +19,7 @@ It uses [Apache OpenDAL](https://github.com/apache/opendal) as a unified storage
 - CORS support, including preflight handling
 - SPA fallback mode
 - Basic Auth and IP allow / block lists
+- Per-IP rate limiting (token bucket) for DoS resistance
 - URL redirect rules
 - Graceful shutdown with a configurable SIGTERM drain window
 - Access logging (text or JSON) and a Prometheus `/metrics` endpoint
@@ -85,6 +86,9 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_BASIC_AUTH_REALM` | `static` | Realm string in the `WWW-Authenticate` header |
 | `STATIC_IP_ALLOWLIST` | — | Comma-separated allowed IPs / CIDRs. See [IP Access Control](#ip-access-control). |
 | `STATIC_IP_BLOCKLIST` | — | Comma-separated blocked IPs / CIDRs (checked before the allowlist) |
+| `STATIC_RATE_LIMIT` | `0` | Per-IP rate limit in requests/sec (`0` disables). See [Rate Limiting](#rate-limiting). |
+| `STATIC_RATE_LIMIT_BURST` | — | Token-bucket burst capacity (defaults to `STATIC_RATE_LIMIT`) |
+| `STATIC_RATE_LIMIT_EXEMPT` | — | Comma-separated IPs / CIDRs exempt from rate limiting |
 
 ### Content & Headers
 
@@ -156,6 +160,23 @@ STATIC_IP_ALLOWLIST=192.168.0.0/16
 ```
 
 Rejected requests receive a `403`. The `/health` endpoint always bypasses IP access control.
+
+## Rate Limiting
+
+Protect against bursts and DoS with a per-IP [token bucket](https://en.wikipedia.org/wiki/Token_bucket). It is **disabled by default**; set `STATIC_RATE_LIMIT` to the sustained number of requests per second allowed per client IP. `STATIC_RATE_LIMIT_BURST` is the bucket capacity — how many requests can arrive at once before the sustained rate applies — and defaults to `STATIC_RATE_LIMIT` when unset.
+
+```bash
+# Allow 50 req/s per IP, tolerating short bursts of up to 100
+STATIC_RATE_LIMIT=50
+STATIC_RATE_LIMIT_BURST=100
+
+# Exempt trusted networks (internal services, monitoring) from the limit
+STATIC_RATE_LIMIT_EXEMPT=10.0.0.0/8,192.168.0.0/16,127.0.0.1
+```
+
+The client IP is resolved the same way as IP access control (`X-Forwarded-For`, then `X-Real-IP`, then the connection address), so place the server behind a trusted proxy that sets these headers if you are not terminating connections directly. Requests that exceed the limit receive `429 Too Many Requests` with a `Retry-After` header (seconds). Limiting is applied after IP access control, and the `/health` and `/metrics` routes bypass it entirely.
+
+Clients whose IP matches `STATIC_RATE_LIMIT_EXEMPT` (individual IPs or CIDR ranges, IPv4 or IPv6) skip the limiter — useful for internal networks, health checkers, or trusted upstreams that should never be throttled.
 
 ## Redirect Rules
 

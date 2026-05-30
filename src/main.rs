@@ -52,6 +52,7 @@ use tracing_subscriber::FmtSubscriber;
 mod config;
 mod error;
 mod metrics;
+mod rate_limit;
 mod serve;
 mod storage;
 
@@ -381,6 +382,22 @@ async fn serve(
         return Err(Error::Forbidden);
     }
 
+    // Per-IP rate limiting (token bucket), after IP access control so blocked
+    // IPs never allocate bucket state. No-op (and lock-free) when disabled.
+    // IPs/CIDRs in STATIC_RATE_LIMIT_EXEMPT (e.g. trusted internal networks or
+    // monitors) skip the limiter entirely. Like the 401/405 guards below, this
+    // is a bare response — it does not go through the custom error page or
+    // apply_common_headers.
+    let rate_exempt = config.rate_limit_exempt.iter().any(|net| net.contains(&ip));
+    if !rate_exempt && let Some(retry_after) = rate_limit::check(ip) {
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        if let Ok(v) = HeaderValue::try_from(retry_after.to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+        return Ok(resp);
+    }
+
     let origin = req_headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -586,6 +603,7 @@ fn main() {
     init_logger();
     let config = Arc::new(Config::new());
     init_error_template(config.error_page.as_deref());
+    rate_limit::init(config.rate_limit, config.rate_limit_burst);
     info!(
         config = ?config,
         "starting static server",
