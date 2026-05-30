@@ -2,7 +2,7 @@ name: "publish"
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
-    # branches: [main]
+    branches: [main]
 
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -120,16 +120,25 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-      - name: Extract version from Git tag
+      - name: Compute image tags
         id: get_version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+        run: |
+          # Tag push (vX.Y.Z) → publish :<version> and :latest.
+          # Branch push (main) → publish :latest only (no version to derive).
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "MANIFEST_TAGS=-t ${{ env.IMAGE_NAME }}:${VERSION}${{ matrix.variant.suffix }} -t ${{ env.IMAGE_NAME }}:latest${{ matrix.variant.suffix }}" >> $GITHUB_ENV
+            echo "PRIMARY_TAG=${{ env.IMAGE_NAME }}:${VERSION}${{ matrix.variant.suffix }}" >> $GITHUB_ENV
+          else
+            echo "MANIFEST_TAGS=-t ${{ env.IMAGE_NAME }}:latest${{ matrix.variant.suffix }}" >> $GITHUB_ENV
+            echo "PRIMARY_TAG=${{ env.IMAGE_NAME }}:latest${{ matrix.variant.suffix }}" >> $GITHUB_ENV
+          fi
       - name: Create and push multi-arch manifest
         working-directory: ${{ runner.temp }}/digests
         run: |
           docker buildx imagetools create \
-            -t ${{ env.IMAGE_NAME }}:${{ env.VERSION }}${{ matrix.variant.suffix }} \
-            -t ${{ env.IMAGE_NAME }}:latest${{ matrix.variant.suffix }} \
+            ${{ env.MANIFEST_TAGS }} \
             $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ env.VERSION }}${{ matrix.variant.suffix }}
+          docker buildx imagetools inspect ${{ env.PRIMARY_TAG }}
