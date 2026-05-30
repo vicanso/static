@@ -160,8 +160,7 @@ fn new_s3_dal(url: &str) -> Result<Storage> {
 #[cfg(not(feature = "s3"))]
 fn new_s3_dal(_url: &str) -> Result<Storage> {
     Err(Error::InvalidFile {
-        message: "s3 backend is not enabled in this build (rebuild with --features s3)"
-            .to_string(),
+        message: "s3 backend is not enabled in this build (rebuild with --features s3)".to_string(),
     })
 }
 

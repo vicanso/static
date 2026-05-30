@@ -11,7 +11,7 @@
 - 基于 OpenDAL 的多存储后端——S3、FTP、GridFS、本地文件系统
 - 内置 gzip / brotli / zstd 压缩，并支持预压缩文件（`.br` / `.zst` / `.gz`）
 - TinyUFO LRU 缓存，大小与 TTL 可配置
-- HTTP Range 请求（206 Partial Content），支持 `If-Range`、断点续传与音视频拖拽
+- HTTP Range 请求（206 Partial Content），支持 `If-Range`、多段 Range（`multipart/byteranges`）、断点续传与音视频拖拽
 - 可选的 304 Not Modified（基于 ETag / If-None-Match）
 - 目录自动索引
 - HTML 内容动态替换

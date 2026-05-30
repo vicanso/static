@@ -27,6 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
 use tokio::sync::Notify;
@@ -84,7 +85,8 @@ impl HtmlReplacer {
     }
 
     pub fn replace_all_bytes(&self, haystack: &[u8]) -> Vec<u8> {
-        self.automaton.replace_all_bytes(haystack, &self.replacements)
+        self.automaton
+            .replace_all_bytes(haystack, &self.replacements)
     }
 }
 
@@ -406,9 +408,7 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
                 }
             }
         }
-        if let Some(info) =
-            get_file_from_cache(&encoding_cache_key(&file, ""), params.cache_size)
-        {
+        if let Some(info) = get_file_from_cache(&encoding_cache_key(&file, ""), params.cache_size) {
             crate::metrics::record_cache_hit();
             return Ok(info);
         }
@@ -650,9 +650,7 @@ async fn load_file(
         // Only apply HTML replacements to HTML content. Single pass: the
         // Aho-Corasick automaton walks the body once and emits one new Vec,
         // regardless of how many (key, value) pairs are configured.
-        if is_html
-            && let Some(replacer) = &params.html_replacer
-        {
+        if is_html && let Some(replacer) = &params.html_replacer {
             buf = replacer.replace_all_bytes(&buf);
         }
         Some(Bytes::from(buf))
@@ -683,28 +681,43 @@ async fn load_file(
     Ok(info)
 }
 
-#[derive(Clone, Copy)]
-enum RangeValue {
-    Satisfiable(u64, u64),
+// A parsed `Range` header. `Ranges` holds one or more satisfiable byte ranges
+// (inclusive, clamped to the representation) in request order: a single entry
+// yields a `206` with `Content-Range`, multiple entries a `multipart/byteranges`
+// body.
+#[derive(Clone)]
+enum RangesValue {
     NotSatisfiable,
+    Ranges(Vec<(u64, u64)>),
 }
 
-fn parse_range(range_header: &str, total_size: u64) -> Option<RangeValue> {
-    let range_str = range_header.strip_prefix("bytes=")?;
-    if range_str.contains(',') {
-        return None; // multi-range not supported
-    }
-    let (start_str, end_str) = range_str.split_once('-')?;
+enum OneRange {
+    Satisfiable(u64, u64),
+    Unsatisfiable,
+}
+
+// Cap on ranges accepted in a single request. A client can otherwise amplify one
+// request into thousands of tiny reads / multipart parts; beyond this we ignore
+// the Range header entirely and serve the full 200.
+const MAX_RANGES: usize = 100;
+
+// Parse a single `start-end` spec against the representation size. `None` means
+// the spec is syntactically malformed — per RFC 7233 the caller then ignores the
+// whole Range header and serves the full representation.
+fn parse_one_range(spec: &str, total_size: u64) -> Option<OneRange> {
+    let (start_str, end_str) = spec.split_once('-')?;
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
 
     if total_size == 0 {
-        return Some(RangeValue::NotSatisfiable);
+        return Some(OneRange::Unsatisfiable);
     }
 
     let (start, end) = if start_str.is_empty() {
-        // bytes=-500
+        // bytes=-500 (suffix length)
         let suffix_len: u64 = end_str.parse().ok()?;
         if suffix_len == 0 {
-            return Some(RangeValue::NotSatisfiable);
+            return Some(OneRange::Unsatisfiable);
         }
         if suffix_len >= total_size {
             (0, total_size - 1)
@@ -715,7 +728,7 @@ fn parse_range(range_header: &str, total_size: u64) -> Option<RangeValue> {
         // bytes=500-
         let start: u64 = start_str.parse().ok()?;
         if start >= total_size {
-            return Some(RangeValue::NotSatisfiable);
+            return Some(OneRange::Unsatisfiable);
         }
         (start, total_size - 1)
     } else {
@@ -726,12 +739,98 @@ fn parse_range(range_header: &str, total_size: u64) -> Option<RangeValue> {
             return None; // malformed
         }
         if start >= total_size {
-            return Some(RangeValue::NotSatisfiable);
+            return Some(OneRange::Unsatisfiable);
         }
         (start, end.min(total_size - 1))
     };
 
-    Some(RangeValue::Satisfiable(start, end))
+    Some(OneRange::Satisfiable(start, end))
+}
+
+// Parse a full `Range` header (`bytes=a-b,c-d,...`). Returns `None` when the
+// header is absent/unparsable or carries too many ranges (→ full 200),
+// `NotSatisfiable` when every range is unsatisfiable (→ 416), or the satisfiable
+// ranges in request order. A single satisfiable range is the common single-206
+// case; unsatisfiable members of an otherwise-satisfiable set are dropped (RFC
+// 7233 §4.1).
+fn parse_ranges(range_header: &str, total_size: u64) -> Option<RangesValue> {
+    let range_str = range_header.strip_prefix("bytes=")?;
+    let mut satisfiable: Vec<(u64, u64)> = Vec::new();
+    let mut count = 0usize;
+    for spec in range_str.split(',') {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            continue;
+        }
+        count += 1;
+        if count > MAX_RANGES {
+            return None;
+        }
+        match parse_one_range(spec, total_size)? {
+            OneRange::Satisfiable(start, end) => satisfiable.push((start, end)),
+            OneRange::Unsatisfiable => {}
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    if satisfiable.is_empty() {
+        return Some(RangesValue::NotSatisfiable);
+    }
+    Some(RangesValue::Ranges(satisfiable))
+}
+
+// Monotonic counter feeding the multipart boundary token. Combined with the
+// representation size it makes a boundary unique per response and vanishingly
+// unlikely to collide with the payload bytes.
+static MULTIPART_BOUNDARY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_multipart_boundary(total_size: u64) -> String {
+    let n = MULTIPART_BOUNDARY_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("static_serve_{total_size:x}_{n:016x}")
+}
+
+// Assemble a `multipart/byteranges` body in memory. Each part carries a boundary
+// line plus `Content-Type`/`Content-Range` headers, then the range bytes; the
+// epilogue is the closing `--boundary--`. Buffered bodies are sliced directly;
+// streamed (large) files read each range from the backend. Unlike the single-
+// range path this buffers the requested bytes rather than streaming — multi-range
+// is used almost exclusively for small seeks (media, PDFs) and the range count is
+// capped by MAX_RANGES.
+async fn build_multipart_byteranges(
+    file_info: &FileInfo,
+    ranges: &[(u64, u64)],
+    total_size: u64,
+    boundary: &str,
+) -> Result<Bytes> {
+    let content_type = file_info
+        .headers
+        .iter()
+        .find(|(k, _)| *k == header::CONTENT_TYPE)
+        .and_then(|(_, v)| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+
+    let mut buf: Vec<u8> = Vec::new();
+    for &(start, end) in ranges {
+        let part_header = format!(
+            "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{total_size}\r\n\r\n"
+        );
+        buf.extend_from_slice(part_header.as_bytes());
+        if let Some(body) = file_info.body.as_ref() {
+            buf.extend_from_slice(&body[start as usize..=end as usize]);
+        } else {
+            let chunk = get_storage()?
+                .dal
+                .read_with(&file_info.read_file)
+                .range(start..=end)
+                .await
+                .map_err(|e| Error::Openedal { source: e })?;
+            buf.extend_from_slice(&chunk.to_vec());
+        }
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    Ok(Bytes::from(buf))
 }
 
 // 处理函数
@@ -754,9 +853,7 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
                 file_info
                     .headers
                     .iter()
-                    .filter(|(k, _)| {
-                        *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING
-                    })
+                    .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING)
                     .cloned(),
             );
             return Ok(resp);
@@ -786,8 +883,7 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
     // HEAD: respond with headers only — never read or stream the body.
     if params.head {
         let mut resp = Response::new(Body::empty());
-        resp.headers_mut()
-            .extend(file_info.headers.iter().cloned());
+        resp.headers_mut().extend(file_info.headers.iter().cloned());
         return Ok(resp);
     }
 
@@ -805,17 +901,36 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
             if_range_satisfied(ir, etag, file_info.last_modified_secs)
         }
     };
-    let range = if honor_range {
+    let ranges = if honor_range {
         params
             .range
             .as_deref()
-            .and_then(|r| parse_range(r, total_size))
+            .and_then(|r| parse_ranges(r, total_size))
     } else {
         None
     };
 
+    // A representation that carries its own Content-Encoding (a negotiated
+    // pre-compressed sibling, or a backend-set encoding) can't be wrapped in a
+    // multipart/byteranges envelope — the envelope itself isn't brotli/gzip and
+    // there's no per-representation Content-Encoding for multipart. Fall back to
+    // a full 200 for the rare (multi-range + encoded) combination; a single
+    // range of an encoded representation is still served as a 206 below.
+    let ranges = match ranges {
+        Some(RangesValue::Ranges(rs))
+            if rs.len() > 1
+                && file_info
+                    .headers
+                    .iter()
+                    .any(|(k, _)| *k == header::CONTENT_ENCODING) =>
+        {
+            None
+        }
+        other => other,
+    };
+
     // 416 Range Not Satisfiable
-    if matches!(range, Some(RangeValue::NotSatisfiable)) {
+    if matches!(ranges, Some(RangesValue::NotSatisfiable)) {
         let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
         resp.headers_mut().insert(
             header::CONTENT_RANGE,
@@ -832,9 +947,14 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         return Ok(resp);
     }
 
-    let is_partial = matches!(range, Some(RangeValue::Satisfiable(_, _)));
+    let single_range = match &ranges {
+        Some(RangesValue::Ranges(rs)) if rs.len() == 1 => Some(rs[0]),
+        _ => None,
+    };
+    let is_multipart = matches!(&ranges, Some(RangesValue::Ranges(rs)) if rs.len() > 1);
+    let is_partial = single_range.is_some() || is_multipart;
 
-    let mut resp = if let Some(RangeValue::Satisfiable(start, end)) = range {
+    let mut resp = if let Some((start, end)) = single_range {
         let content_length = end - start + 1;
         let mut resp = if let Some(body) = file_info.body.as_ref() {
             body.slice(start as usize..=end as usize).into_response()
@@ -865,6 +985,25 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
                 .unwrap_or_else(|_| HeaderValue::from_static("0")),
         );
         resp
+    } else if let Some(RangesValue::Ranges(rs)) = &ranges {
+        // Multiple ranges → multipart/byteranges (the single-range case above
+        // returns a plain 206). Boundary is unique per response.
+        let boundary = next_multipart_boundary(total_size);
+        let payload = build_multipart_byteranges(&file_info, rs, total_size, &boundary).await?;
+        let content_length = payload.len();
+        let mut resp = payload.into_response();
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::try_from(format!("multipart/byteranges; boundary={boundary}"))
+                .unwrap_or_else(|_| HeaderValue::from_static("multipart/byteranges")),
+        );
+        resp.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&content_length.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("0")),
+        );
+        resp
     } else if let Some(body) = file_info.body.as_ref() {
         body.clone().into_response()
     } else {
@@ -883,11 +1022,22 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         Body::from_stream(stream).into_response()
     };
 
+    // Partial responses set their own Content-Length above; multipart also
+    // replaces Content-Type with the envelope type and drops any representation
+    // Content-Encoding — exclude all three from the header copy here.
     resp.headers_mut().extend(
         file_info
             .headers
             .iter()
-            .filter(|(k, _)| !(is_partial && *k == header::CONTENT_LENGTH))
+            .filter(|(k, _)| {
+                if is_partial && *k == header::CONTENT_LENGTH {
+                    return false;
+                }
+                if is_multipart && (*k == header::CONTENT_TYPE || *k == header::CONTENT_ENCODING) {
+                    return false;
+                }
+                true
+            })
             .cloned(),
     );
 

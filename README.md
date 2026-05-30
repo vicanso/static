@@ -11,7 +11,7 @@ It uses [Apache OpenDAL](https://github.com/apache/opendal) as a unified storage
 - Multiple storage backends via OpenDAL — S3, FTP, GridFS, local filesystem
 - Built-in gzip / brotli / zstd compression, plus pre-compressed file support (`.br` / `.zst` / `.gz`)
 - TinyUFO LRU cache with configurable size and TTL
-- HTTP Range requests (206 Partial Content) with `If-Range`, for resumable downloads and media seeking
+- HTTP Range requests (206 Partial Content) with `If-Range`, including multiple ranges via `multipart/byteranges`, for resumable downloads and media seeking
 - Optional 304 Not Modified via ETag / If-None-Match
 - Directory auto-indexing
 - Dynamic HTML content replacement

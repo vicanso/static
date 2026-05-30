@@ -83,12 +83,15 @@ fn parse_compress_level_or_exit(raw: Option<&str>) -> CompressionLevel {
             "fastest" => CompressionLevel::Fastest,
             "best" => CompressionLevel::Best,
             "default" => CompressionLevel::Default,
-            other => other.parse::<i32>().map(CompressionLevel::Precise).unwrap_or_else(|_| {
-                error!(
-                    "Invalid STATIC_COMPRESS_LEVEL={s}: expected fastest|best|default|<integer>"
-                );
-                std::process::exit(1)
-            }),
+            other => other
+                .parse::<i32>()
+                .map(CompressionLevel::Precise)
+                .unwrap_or_else(|_| {
+                    error!(
+                        "Invalid STATIC_COMPRESS_LEVEL={s}: expected fastest|best|default|<integer>"
+                    );
+                    std::process::exit(1)
+                }),
         },
     }
 }
