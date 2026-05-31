@@ -64,11 +64,14 @@ jobs:
           # Push by digest only: no per-arch (:amd64/:arm64) tag is created on
           # Docker Hub. The `merge` job assembles the single versioned manifest.
           IMAGE_OUTPUT: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          # force-compression=true re-encodes every layer (incl. the debian
-          # base) to zstd: smaller image at the cost of no longer sharing the
-          # upstream gzip blob. oci-mediatypes=true is required for the registry
-          # and clients to recognise zstd layers.
-          ZSTD_OPTS: compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true
+          # compression=zstd encodes the layers BuildKit builds itself (our app
+          # layer) with zstd. force-compression=false leaves already-compressed
+          # inherited layers — the debian:trixie-slim base — in their upstream
+          # gzip form, so those blobs stay shared/deduplicated across debian
+          # images and aren't needlessly re-encoded and re-pushed every build.
+          # oci-mediatypes=true is required for the registry and clients to
+          # recognise the zstd layers.
+          ZSTD_OPTS: compression=zstd,compression-level=3,force-compression=false,oci-mediatypes=true
         with:
           context: .
           file: ./Dockerfile
