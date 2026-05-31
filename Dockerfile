@@ -15,16 +15,14 @@ FROM debian:trixie-slim
 
 EXPOSE 3000
 
-# ca-certificates is required by reqwest+rustls (opendal's HTTPS/S3 backend
-# panics on Client::new() if the system trust store is empty). trixie-slim
-# does not pre-install it.
-# Clean apt/dpkg/debconf leftovers and logs in the SAME layer as the install so
-# they are never committed: the package lists, apt's .deb cache (incl. its lock
-# file), the debconf template caches, dpkg's status-old backup, and all logs.
-# (/var/lib/dpkg/status itself is the package DB — keep it.)
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives /var/cache/debconf/* /var/lib/dpkg/*-old /var/log/*
+# reqwest+rustls (opendal's HTTPS/S3 backend) panics on Client::new() if the
+# system trust store is empty, and trixie-slim ships no CA bundle. Instead of
+# running apt here — which permanently bakes ~1.6 MiB of dpkg/debconf cruft into
+# the layer (the rewritten /var/lib/dpkg/status DB can't be deleted) — copy the
+# CA bundle the builder stage already generated. No package manager runs in the
+# runtime stage, so there is no apt/dpkg waste to clean. reqwest+rustls reads
+# this path (openssl-probe's default SSL_CERT_FILE).
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # Service account with /bin/false to block login; `-m` still creates a home
 # dir so `docker exec -it <container> bash` (invoked explicitly) has a HOME.
