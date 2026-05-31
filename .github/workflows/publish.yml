@@ -18,13 +18,6 @@ jobs:
         platform:
           - { arch: "linux/amd64", tag: "amd64", runs-on: "ubuntu-24.04" }
           - { arch: "linux/arm64", tag: "arm64", runs-on: "ubuntu-24.04-arm" }
-        variant:
-          # default: force-compression=false → debian:trixie-slim base layer
-          # keeps upstream gzip digest, globally reusable across debian images.
-          - { name: "default", suffix: "", force_compression: "false" }
-          # zstd: force-compression=true → every layer re-encoded to zstd
-          # (smaller image, but debian base no longer shares blob with upstream).
-          - { name: "zstd", suffix: "-zstd", force_compression: "true" }
     steps:
       - name: Change Swap Space
         run: |
@@ -71,14 +64,11 @@ jobs:
           # Push by digest only: no per-arch (:amd64/:arm64) tag is created on
           # Docker Hub. The `merge` job assembles the single versioned manifest.
           IMAGE_OUTPUT: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          # force_compression comes from the matrix variant:
-          #   default → false: debian base layer keeps upstream gzip blob
-          #     (globally reused across debian-based images).
-          #   zstd    → true : every layer (incl. debian base) re-encoded to
-          #     zstd; smaller image, no upstream layer sharing.
-          # oci-mediatypes=true is required for any zstd layer to be
-          # recognised by the registry/clients.
-          ZSTD_OPTS: compression=zstd,compression-level=3,force-compression=${{ matrix.variant.force_compression }},oci-mediatypes=true
+          # force-compression=true re-encodes every layer (incl. the debian
+          # base) to zstd: smaller image at the cost of no longer sharing the
+          # upstream gzip blob. oci-mediatypes=true is required for the registry
+          # and clients to recognise zstd layers.
+          ZSTD_OPTS: compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true
         with:
           context: .
           file: ./Dockerfile
@@ -94,24 +84,19 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.variant.name }}-${{ matrix.platform.tag }}
+          name: digests-${{ matrix.platform.tag }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
   merge:
     runs-on: ubuntu-24.04
     needs: [build] # 等待所有架构构建完成
-    strategy:
-      matrix:
-        variant:
-          - { name: "default", suffix: "" }
-          - { name: "zstd", suffix: "-zstd" }
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-${{ matrix.variant.name }}-*
+          pattern: digests-*
           merge-multiple: true
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -127,11 +112,11 @@ jobs:
           # Branch push (main) → publish :latest only (no version to derive).
           if [ "${{ github.ref_type }}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
-            echo "MANIFEST_TAGS=-t ${{ env.IMAGE_NAME }}:${VERSION}${{ matrix.variant.suffix }} -t ${{ env.IMAGE_NAME }}:latest${{ matrix.variant.suffix }}" >> $GITHUB_ENV
-            echo "PRIMARY_TAG=${{ env.IMAGE_NAME }}:${VERSION}${{ matrix.variant.suffix }}" >> $GITHUB_ENV
+            echo "MANIFEST_TAGS=-t ${{ env.IMAGE_NAME }}:${VERSION} -t ${{ env.IMAGE_NAME }}:latest" >> $GITHUB_ENV
+            echo "PRIMARY_TAG=${{ env.IMAGE_NAME }}:${VERSION}" >> $GITHUB_ENV
           else
-            echo "MANIFEST_TAGS=-t ${{ env.IMAGE_NAME }}:latest${{ matrix.variant.suffix }}" >> $GITHUB_ENV
-            echo "PRIMARY_TAG=${{ env.IMAGE_NAME }}:latest${{ matrix.variant.suffix }}" >> $GITHUB_ENV
+            echo "MANIFEST_TAGS=-t ${{ env.IMAGE_NAME }}:latest" >> $GITHUB_ENV
+            echo "PRIMARY_TAG=${{ env.IMAGE_NAME }}:latest" >> $GITHUB_ENV
           fi
       - name: Create and push multi-arch manifest
         working-directory: ${{ runner.temp }}/digests
