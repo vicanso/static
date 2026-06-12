@@ -53,6 +53,11 @@ pub struct Config {
     pub response_headers: HeaderMap,
     pub cache_size: usize,
     pub cache_ttl: Duration,
+    // Opt-in short cache TTLs (zero = disabled), both capped at 5 minutes:
+    // negative caching of 404 lookups, and in-memory caching of HTML bodies
+    // (which are otherwise never cached because deploys mutate them).
+    pub not_found_cache_ttl: Duration,
+    pub html_cache_ttl: Duration,
     pub not_modified: bool,
     pub precompressed: bool,
     pub access_log: bool,
@@ -103,6 +108,24 @@ fn parse_compress_level_or_exit(raw: Option<&str>) -> CompressionLevel {
     }
 }
 
+// Upper bound for the opt-in short cache TTLs (404 negative cache, HTML
+// cache). Both trade a small, bounded staleness window for fewer backend
+// round-trips; a long value here (e.g. a "5h" typo) would silently pin
+// deleted files or stale HTML, so anything above 5 minutes is rejected.
+const SHORT_CACHE_TTL_MAX: Duration = Duration::from_secs(5 * 60);
+
+fn parse_short_cache_ttl_or_exit(name: &str, raw: Option<&str>) -> Duration {
+    let ttl = parse_duration_or_exit(name, raw, Duration::ZERO);
+    if ttl > SHORT_CACHE_TTL_MAX {
+        error!(
+            "Invalid {name}={}: must be 5 minutes or less",
+            raw.unwrap_or_default()
+        );
+        std::process::exit(1)
+    }
+    ttl
+}
+
 // Parse an optional byte size from env. Absent -> default;
 // present but invalid -> log and exit.
 fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
@@ -132,6 +155,8 @@ struct EnvConfig {
     fallback_html_404: bool,
     cache_size: usize,
     cache_ttl: Option<String>,
+    not_found_cache_ttl: Option<String>,
+    html_cache_ttl: Option<String>,
     not_modified: bool,
     precompressed: bool,
     access_log: bool,
@@ -168,6 +193,8 @@ impl Default for EnvConfig {
             fallback_html_404: false,
             cache_size: 1024,
             cache_ttl: None,
+            not_found_cache_ttl: None,
+            html_cache_ttl: None,
             not_modified: false,
             precompressed: false,
             access_log: true,
@@ -290,6 +317,14 @@ impl Config {
                 "STATIC_CACHE_TTL",
                 env_cfg.cache_ttl.as_deref(),
                 Duration::from_secs(10 * 60),
+            ),
+            not_found_cache_ttl: parse_short_cache_ttl_or_exit(
+                "STATIC_NOT_FOUND_CACHE_TTL",
+                env_cfg.not_found_cache_ttl.as_deref(),
+            ),
+            html_cache_ttl: parse_short_cache_ttl_or_exit(
+                "STATIC_HTML_CACHE_TTL",
+                env_cfg.html_cache_ttl.as_deref(),
             ),
             not_modified: env_cfg.not_modified,
             precompressed: env_cfg.precompressed,

@@ -41,7 +41,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use substring::Substring;
 use tokio::signal;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
@@ -460,15 +459,14 @@ async fn serve(
         }
     }
 
-    let file = if !path.is_empty() {
-        path.substring(1, path.len()).to_string()
-    } else {
-        path.to_string()
-    };
-    let file = if let Ok(file) = urlencoding::decode(&file) {
-        file.to_string()
-    } else {
-        file
+    // Strip the leading '/' without allocating, then url-decode straight into an
+    // owned String. `decode` returns a Cow that borrows when there is nothing to
+    // decode, so `into_owned` allocates exactly once — vs the old path which
+    // allocated for the substring and again for the decode.
+    let path_no_slash = path.strip_prefix('/').unwrap_or(path);
+    let file = match urlencoding::decode(path_no_slash) {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => path_no_slash.to_string(),
     };
 
     let index = config.index_file.clone();
@@ -521,6 +519,8 @@ async fn serve(
         file: String::new(),
         cache_size: config.cache_size,
         cache_ttl: config.cache_ttl,
+        not_found_cache_ttl: config.not_found_cache_ttl,
+        html_cache_ttl: config.html_cache_ttl,
         range,
         if_range,
         if_none_match,

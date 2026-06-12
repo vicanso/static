@@ -57,7 +57,9 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_CACHE_CONTROL` | `public, max-age=31536000, immutable` | `Cache-Control` for static assets. HTML is always `no-cache`. |
 | `STATIC_CACHE_CONTROL_EXT_*` | — | Per-extension override, e.g. `STATIC_CACHE_CONTROL_EXT_WASM=no-cache`. See [Per-Extension Cache Control](#per-extension-cache-control). |
 | `STATIC_CACHE_SIZE` | `1024` | LRU cache entry count |
-| `STATIC_CACHE_TTL` | `10m` | Cache TTL. HTML files are never cached. |
+| `STATIC_CACHE_TTL` | `10m` | Cache TTL. HTML files are not cached unless `STATIC_HTML_CACHE_TTL` is set. |
+| `STATIC_NOT_FOUND_CACHE_TTL` | `0` (off) | Negative-cache 404 lookups for this long (max `5m`), so hot missing paths (e.g. a probed `favicon.ico`) skip the backend `stat`. A file created within the window keeps 404ing until it expires. |
+| `STATIC_HTML_CACHE_TTL` | `0` (off) | Cache HTML bodies in memory for this long (max `5m`). Clients still receive `Cache-Control: no-cache`; this only amortizes backend reads — useful for remote backends (S3/FTP/GridFS). Updated HTML may be served stale for up to this window. |
 | `STATIC_NOT_MODIFIED` | `false` | Enable `304 Not Modified` via `If-None-Match` / `ETag` |
 
 ### Compression

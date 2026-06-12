@@ -255,6 +255,12 @@ pub struct StaticServeParams {
     pub html_replacer: Option<Arc<HtmlReplacer>>,
     pub cache_size: usize,
     pub cache_ttl: Duration,
+    // Opt-in short TTLs (zero = disabled, capped at 5 minutes by config
+    // validation): negative caching of 404 lookups, and in-memory caching of
+    // HTML bodies (which clients still receive as `no-cache` — only the
+    // backend round-trips are amortized).
+    pub not_found_cache_ttl: Duration,
+    pub html_cache_ttl: Duration,
     // Per-request header echoes — Arc<str> so the fallback retry loop in
     // main.rs can clone/share them at refcount cost instead of allocating
     // fresh String copies per iteration.
@@ -272,9 +278,18 @@ pub struct StaticServeParams {
 #[derive(Clone)]
 struct FileInfoCache {
     expired_at: u64,
-    // Arc-shared so cache hits cost a refcount bump, not a deep clone of
-    // `headers` (Vec) + `read_file` (String). Bytes is already cheap-clone.
-    data: Arc<FileInfo>,
+    data: CacheValue,
+}
+
+// A cache entry is either a real file or a remembered 404. Negative entries
+// exist only when STATIC_NOT_FOUND_CACHE_TTL > 0 and live under the identity
+// (empty-encoding) key — a 404 does not vary by Accept-Encoding. `Found` is
+// Arc-shared so cache hits cost a refcount bump, not a deep clone of
+// `headers` (Vec) + `read_file` (String). Bytes is already cheap-clone.
+#[derive(Clone)]
+enum CacheValue {
+    Found(Arc<FileInfo>),
+    NotFound,
 }
 
 struct FileInfo {
@@ -305,7 +320,7 @@ fn encoding_cache_key(file: &str, encoding: &str) -> String {
     key
 }
 
-fn get_file_from_cache(file: &String, cache_size: usize) -> Option<Arc<FileInfo>> {
+fn get_file_from_cache(file: &String, cache_size: usize) -> Option<CacheValue> {
     if let Some(info) = get_static_cache(cache_size).get(file)
         && info.expired_at
             > SystemTime::now()
@@ -318,14 +333,26 @@ fn get_file_from_cache(file: &String, cache_size: usize) -> Option<Arc<FileInfo>
     None
 }
 
-fn set_file_to_cache(file: &str, info: Arc<FileInfo>, cache_size: usize, cache_ttl: Duration) {
+// Translate a cache hit into the `get_file` result: a positive entry returns
+// the shared FileInfo, a negative entry replays the remembered 404.
+fn cached_result(hit: CacheValue, file: &str) -> Result<Arc<FileInfo>> {
+    match hit {
+        CacheValue::Found(info) => Ok(info),
+        CacheValue::NotFound => Err(Error::NotFound {
+            file: file.to_string(),
+        }),
+    }
+}
+
+fn set_file_to_cache(key: String, value: CacheValue, cache_size: usize, cache_ttl: Duration) {
     let expired_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
         + cache_ttl.as_secs();
     let cache = get_static_cache(cache_size);
-    let key = file.to_string();
+    // The caller already built the owned key (`encoding_cache_key`); take it by
+    // value so we don't clone it again here.
     // Is this a physically new key, or a re-cache of a still-present but
     // logically-expired entry? The occupancy gauge counts distinct entries, so
     // only a genuinely new key adds one. `put` returns the entries it evicted to
@@ -336,11 +363,33 @@ fn set_file_to_cache(file: &str, info: Arc<FileInfo>, cache_size: usize, cache_t
         key,
         FileInfoCache {
             expired_at,
-            data: info,
+            data: value,
         },
         1,
     );
     metrics::record_cache_insert(is_new, evicted.len());
+}
+
+// Negative-cache a 404 (opt-in via STATIC_NOT_FOUND_CACHE_TTL). Keyed by the
+// request path under the identity encoding so every later lookup — whatever
+// its Accept-Encoding — hits it on the identity probe and skips the backend
+// `stat` entirely. Only genuine not-found results are stored; other errors
+// (and the request-specific 301 redirect) are never cached.
+fn maybe_cache_not_found(params: &StaticServeParams, res: &Result<Arc<FileInfo>>) {
+    if params.cache_size == 0 || params.not_found_cache_ttl.is_zero() {
+        return;
+    }
+    if let Err(e) = res
+        && e.is_not_found()
+    {
+        let key = encoding_cache_key(&params.file, "");
+        set_file_to_cache(
+            key,
+            CacheValue::NotFound,
+            params.cache_size,
+            params.not_found_cache_ttl,
+        );
+    }
 }
 
 // Single-flight coordination. A burst of concurrent cache misses for the same
@@ -407,20 +456,34 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     // that was never cached is a cheap in-memory miss, so unsupported paths
     // (e.g. HTML, which is never cached) simply fall through to the slow path.
     if params.cache_size > 0 {
+        // Reuse a single key buffer across every probe instead of allocating a
+        // fresh String per encoding (up to 4 per request). The `<path>\0` prefix
+        // is constant; only the encoding suffix changes, so truncate back to it
+        // and rewrite. Capacity covers the longest suffix ("zstd"/"gzip") so no
+        // probe regrows the buffer.
+        let mut key = String::with_capacity(file.len() + 1 + 4);
+        key.push_str(&file);
+        key.push('\u{0}');
+        let prefix_len = key.len();
         if let Some(prefs) = &accept_prefs {
             for enc in ["br", "zstd", "gzip"] {
-                if prefs.accepts(enc)
-                    && let Some(info) =
-                        get_file_from_cache(&encoding_cache_key(&file, enc), params.cache_size)
-                {
-                    metrics::record_cache_hit();
-                    return Ok(info);
+                if prefs.accepts(enc) {
+                    key.truncate(prefix_len);
+                    key.push_str(enc);
+                    if let Some(hit) = get_file_from_cache(&key, params.cache_size) {
+                        metrics::record_cache_hit();
+                        return cached_result(hit, &file);
+                    }
                 }
             }
         }
-        if let Some(info) = get_file_from_cache(&encoding_cache_key(&file, ""), params.cache_size) {
+        // identity: empty suffix (back to just `<path>\0`). Negative (404)
+        // entries live only under this key, so they are reached regardless of
+        // what the client accepts.
+        key.truncate(prefix_len);
+        if let Some(hit) = get_file_from_cache(&key, params.cache_size) {
             metrics::record_cache_hit();
-            return Ok(info);
+            return cached_result(hit, &file);
         }
         metrics::record_cache_miss();
     }
@@ -453,7 +516,9 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         if let Some(info) = flight.result() {
             return Ok(info);
         }
-        return load_file(params, file, &accept_prefs).await;
+        let res = load_file(params, file, &accept_prefs).await;
+        maybe_cache_not_found(params, &res);
+        return res;
     }
 
     // Leader: load, hand the result to any followers, then clear the slot.
@@ -468,6 +533,7 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         }
         flight.done.notify_waiters();
     }
+    maybe_cache_not_found(params, &res);
     res
 }
 
@@ -499,7 +565,10 @@ async fn load_file(
         }
         return Err(Error::MovedPermanently { location });
     }
-    let mut headers = Vec::with_capacity(8);
+    // The file path pushes up to 9 headers (Accept-Ranges, Cache-Control,
+    // Content-Type, Content-Encoding, Vary, ETag, Last-Modified, X-Original-Size,
+    // Content-Length); size to 10 so it never reallocates.
+    let mut headers = Vec::with_capacity(10);
     headers.push((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")));
 
     if is_dir && params.autoindex {
@@ -650,20 +719,23 @@ async fn load_file(
     // read html or small file
     let read_file = precompressed_file.as_deref().unwrap_or(&file);
     let body = if !params.head && (is_html || size < params.read_max_size) {
-        let mut buf = storage
+        let buffer = storage
             .dal
             .read(read_file)
             .await
-            .map_err(|e| Error::Openedal { source: e })?
-            .to_vec();
+            .map_err(|e| Error::Openedal { source: e })?;
 
         // Only apply HTML replacements to HTML content. Single pass: the
         // Aho-Corasick automaton walks the body once and emits one new Vec,
         // regardless of how many (key, value) pairs are configured.
         if is_html && let Some(replacer) = &params.html_replacer {
-            buf = replacer.replace_all_bytes(&buf);
+            Some(Bytes::from(replacer.replace_all_bytes(&buffer.to_bytes())))
+        } else {
+            // `Buffer::to_bytes` is zero-copy when the backend returned one
+            // contiguous chunk (the common case for a single read) — unlike the
+            // previous `to_vec()`, which always copied the whole body.
+            Some(buffer.to_bytes())
         }
-        Some(Bytes::from(buf))
     } else {
         None
     };
@@ -683,9 +755,22 @@ async fn load_file(
         read_file: read_path,
         last_modified_secs,
     });
-    if params.cache_size > 0 && !is_html && !params.head {
-        let key = encoding_cache_key(&file, negotiated_encoding);
-        set_file_to_cache(&key, info.clone(), params.cache_size, params.cache_ttl);
+    if params.cache_size > 0 && !params.head {
+        // HTML is cached only when STATIC_HTML_CACHE_TTL opted in (clients
+        // still see `no-cache`; this only amortizes backend reads over a short,
+        // bounded window). Everything else keeps the regular TTL. Key by the
+        // *request* path (`params.file`), not the possibly index-joined `file`
+        // — lookups probe the request path, so a directory request must store
+        // under the key it will probe next time.
+        let ttl = if is_html {
+            params.html_cache_ttl
+        } else {
+            params.cache_ttl
+        };
+        if !ttl.is_zero() {
+            let key = encoding_cache_key(&params.file, negotiated_encoding);
+            set_file_to_cache(key, CacheValue::Found(info.clone()), params.cache_size, ttl);
+        }
     }
 
     Ok(info)
@@ -1201,5 +1286,151 @@ mod tests {
         );
         // benign text is unchanged
         assert_eq!(html_escape("plain.txt"), "plain.txt");
+    }
+
+    #[test]
+    fn singleflight_key_varies_by_inputs() {
+        let br = Some(EncodingPrefs::parse("br"));
+        let gzip = Some(EncodingPrefs::parse("gzip"));
+        let none: Option<EncodingPrefs> = None;
+
+        // identical inputs collapse to the same key (so they single-flight)
+        assert_eq!(
+            singleflight_key("a.js", &br, false),
+            singleflight_key("a.js", &br, false)
+        );
+        // a different accepted-encoding set must not share a leader
+        assert_ne!(
+            singleflight_key("a.js", &br, false),
+            singleflight_key("a.js", &gzip, false)
+        );
+        // HEAD (no body) is a distinct response from GET
+        assert_ne!(
+            singleflight_key("a.js", &br, true),
+            singleflight_key("a.js", &br, false)
+        );
+        // a different path is a different key
+        assert_ne!(
+            singleflight_key("a.js", &br, false),
+            singleflight_key("b.js", &br, false)
+        );
+        // no Accept-Encoding -> all four flag bits are 0
+        assert!(singleflight_key("a.js", &none, false).ends_with("\u{0}0000"));
+    }
+
+    #[test]
+    fn next_multipart_boundary_is_unique_and_formatted() {
+        let b1 = next_multipart_boundary(0xABCD);
+        let b2 = next_multipart_boundary(0xABCD);
+        // the size is hex-encoded into the token
+        assert!(b1.starts_with("static_serve_abcd_"));
+        assert!(b2.starts_with("static_serve_abcd_"));
+        // the monotonic counter makes successive boundaries distinct
+        assert_ne!(b1, b2);
+    }
+
+    #[test]
+    fn build_multipart_byteranges_buffered() {
+        // A buffered (in-memory) body assembles the multipart envelope without
+        // touching storage. Two ranges over a 10-byte body, fixed boundary.
+        let info = FileInfo {
+            headers: vec![(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+            body: Some(Bytes::from_static(b"0123456789")),
+            size: 10,
+            read_file: String::new(),
+            last_modified_secs: None,
+        };
+        let ranges = [(0u64, 2u64), (5u64, 7u64)];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let out = rt
+            .block_on(build_multipart_byteranges(&info, &ranges, 10, "BOUND"))
+            .expect("multipart assembly");
+        let expected = "--BOUND\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-2/10\r\n\r\n012\r\n\
+                        --BOUND\r\nContent-Type: text/plain\r\nContent-Range: bytes 5-7/10\r\n\r\n567\r\n\
+                        --BOUND--\r\n";
+        assert_eq!(out.as_ref(), expected.as_bytes());
+    }
+
+    #[test]
+    fn encoding_prefs_edge_cases() {
+        // an empty header accepts nothing
+        let empty = EncodingPrefs::parse("");
+        assert!(!empty.accepts("br"));
+        assert!(!empty.accepts("gzip"));
+        // whitespace around the name and the q-param is tolerated
+        assert!(EncodingPrefs::parse(" gzip ; q=0.5 ").accepts("gzip"));
+        // a tiny positive q still accepts
+        assert!(EncodingPrefs::parse("br;q=0.001").accepts("br"));
+        // unrecognised tokens are ignored, not fatal
+        let mixed = EncodingPrefs::parse("identity, deflate, br");
+        assert!(mixed.accepts("br"));
+        assert!(!mixed.accepts("gzip")); // no wildcard, so gzip is unaccepted
+        // first occurrence wins: an initial q=0 refusal is not overridden
+        assert!(!EncodingPrefs::parse("br;q=0, br;q=1").accepts("br"));
+    }
+
+    #[test]
+    fn cache_negative_and_positive_roundtrip() {
+        let size = 16;
+        // a stored negative entry comes back as NotFound...
+        set_file_to_cache(
+            "missing.js\u{0}".to_string(),
+            CacheValue::NotFound,
+            size,
+            Duration::from_secs(60),
+        );
+        assert!(matches!(
+            get_file_from_cache(&"missing.js\u{0}".to_string(), size),
+            Some(CacheValue::NotFound)
+        ));
+        // ...and a negative hit replays a not-found error
+        let res = cached_result(CacheValue::NotFound, "missing.js");
+        assert!(matches!(res, Err(e) if e.is_not_found()));
+
+        // a positive entry round-trips the shared FileInfo
+        let info = Arc::new(FileInfo {
+            headers: vec![],
+            body: Some(Bytes::from_static(b"x")),
+            size: 1,
+            read_file: "a.js".to_string(),
+            last_modified_secs: None,
+        });
+        set_file_to_cache(
+            "a.js\u{0}".to_string(),
+            CacheValue::Found(info),
+            size,
+            Duration::from_secs(60),
+        );
+        match get_file_from_cache(&"a.js\u{0}".to_string(), size) {
+            Some(CacheValue::Found(got)) => assert_eq!(got.size, 1),
+            _ => panic!("expected a positive cache hit"),
+        }
+
+        // a zero TTL means the entry is already expired on the next lookup
+        set_file_to_cache(
+            "expired\u{0}".to_string(),
+            CacheValue::NotFound,
+            size,
+            Duration::ZERO,
+        );
+        assert!(get_file_from_cache(&"expired\u{0}".to_string(), size).is_none());
+    }
+
+    #[test]
+    fn parse_ranges_more_edges() {
+        // "bytes=" with no actual spec -> ignore the header (full 200)
+        assert_eq!(parse_ranges("bytes=", 1000), None);
+        // whitespace within the list is tolerated
+        assert_eq!(
+            parse_ranges("bytes= 0-9 , 20-29 ", 1000),
+            Some(RangesValue::Ranges(vec![(0, 9), (20, 29)]))
+        );
+        // a suffix length >= the body clamps to the whole representation
+        assert_eq!(
+            parse_ranges("bytes=-1000", 1000),
+            Some(RangesValue::Ranges(vec![(0, 999)]))
+        );
     }
 }

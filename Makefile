@@ -11,5 +11,8 @@ lint:
 	typos
 	cargo clippy --all-targets --all -- --deny=warnings
 
+test:
+	cargo test
+
 release:
 	cargo build --release

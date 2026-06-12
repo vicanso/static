@@ -57,7 +57,9 @@ docker run -d --restart=always \
 | `STATIC_CACHE_CONTROL` | `public, max-age=31536000, immutable` | 静态资源的 `Cache-Control`。HTML 始终为 `no-cache`。 |
 | `STATIC_CACHE_CONTROL_EXT_*` | — | 按扩展名覆盖，如 `STATIC_CACHE_CONTROL_EXT_WASM=no-cache`。见[按扩展名细化缓存策略](#按扩展名细化缓存策略)。 |
 | `STATIC_CACHE_SIZE` | `1024` | LRU 缓存条目数 |
-| `STATIC_CACHE_TTL` | `10m` | 缓存有效期。HTML 文件不会被缓存。 |
+| `STATIC_CACHE_TTL` | `10m` | 缓存有效期。HTML 文件默认不缓存，除非设置 `STATIC_HTML_CACHE_TTL`。 |
+| `STATIC_NOT_FOUND_CACHE_TTL` | `0`（关闭） | 404 负缓存时长（上限 `5m`）：热点的不存在路径（如被探测的 `favicon.ico`）在窗口内直接返回 404，不再访问后端 `stat`。窗口内新建的同名文件会持续 404 直到过期。 |
+| `STATIC_HTML_CACHE_TTL` | `0`（关闭） | HTML 内存缓存时长（上限 `5m`）。客户端仍收到 `Cache-Control: no-cache`，仅摊薄服务端到后端的读取 —— 对远程后端（S3/FTP/GridFS）收益明显。更新后的 HTML 最多可能延迟此窗口才生效。 |
 | `STATIC_NOT_MODIFIED` | `false` | 启用基于 `If-None-Match` / `ETag` 的 `304 Not Modified` |
 
 ### 压缩
