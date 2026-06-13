@@ -127,6 +127,16 @@ Every option is set via an environment variable and parsed once at startup.
 | `LOG_LEVEL` | `INFO` | Log level: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `LOG_FORMAT` | `text` | Log output format: `text` or `json` |
 
+### Backend Resilience
+
+opendal-level retry/timeout for the storage backend, all off by default. Aimed at remote backends (S3/FTP/GridFS) where a single operation can hang or transiently fail; on local FS the layers never fire. These bound a **single backend operation** and are independent of `STATIC_TIMEOUT` (the whole-request deadline) — keep them a fraction of it so retries fit within the request budget.
+
+| Variable | Default | Description |
+|---|---|---|
+| `STATIC_BACKEND_RETRY_MAX` | `0` (off) | Retry attempts for transient backend errors (opendal `RetryLayer`, exponential backoff). `0` disables retries. Enable `STATIC_BACKEND_IO_TIMEOUT` alongside it so a hung connection becomes a retryable timeout. |
+| `STATIC_BACKEND_TIMEOUT` | — (off) | Per-op timeout for non-streaming ops like `stat` (opendal `TimeoutLayer`). Accepts durations (`5s`, `500ms`). |
+| `STATIC_BACKEND_IO_TIMEOUT` | — (off) | Per-op timeout for streaming reads (between chunks). Accepts durations (`10s`). |
+
 ## Basic Authentication
 
 Protect the server with HTTP Basic Auth by setting one or more `STATIC_BASIC_AUTH_*` variables. The `<NAME>` suffix is an arbitrary label that distinguishes multiple accounts.

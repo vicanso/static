@@ -612,6 +612,11 @@ fn main() {
     let config = Arc::new(Config::new());
     init_error_template(config.error_page.as_deref());
     rate_limit::init(config.rate_limit, config.rate_limit_burst);
+    storage::init_backend_resilience(
+        config.backend_retry_max,
+        config.backend_timeout,
+        config.backend_io_timeout,
+    );
     metrics::set_enabled(config.metrics_enabled);
     metrics::set_cache_capacity(config.cache_size);
     info!(

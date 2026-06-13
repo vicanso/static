@@ -58,6 +58,15 @@ pub struct Config {
     // (which are otherwise never cached because deploys mutate them).
     pub not_found_cache_ttl: Duration,
     pub html_cache_ttl: Duration,
+    // opendal backend resilience (applied in storage.rs), all off by default so
+    // local-FS setups keep current behavior; they matter for remote backends
+    // (S3/FTP/GridFS) where a single op can hang or transiently fail.
+    // `backend_retry_max` = retry attempts (0 = no RetryLayer); the two timeouts
+    // bound a single backend op (None = no TimeoutLayer) and must stay a
+    // fraction of `timeout` so retries fit within the whole-request deadline.
+    pub backend_retry_max: u32,
+    pub backend_timeout: Option<Duration>,
+    pub backend_io_timeout: Option<Duration>,
     pub not_modified: bool,
     pub precompressed: bool,
     pub access_log: bool,
@@ -126,6 +135,21 @@ fn parse_short_cache_ttl_or_exit(name: &str, raw: Option<&str>) -> Duration {
     ttl
 }
 
+// Parse an optional humantime duration with no default: absent or empty -> None
+// (the caller treats None as "do not attach the layer"); present but invalid ->
+// log and exit. Used for the opendal backend timeouts, where unset must mean
+// "off", not "fall back to some duration".
+fn parse_optional_duration_or_exit(name: &str, raw: Option<&str>) -> Option<Duration> {
+    match raw {
+        None => None,
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(humantime::parse_duration(s.trim()).unwrap_or_else(|e| {
+            error!("Invalid {name}={s}: {e}");
+            std::process::exit(1)
+        })),
+    }
+}
+
 // Parse an optional byte size from env. Absent -> default;
 // present but invalid -> log and exit.
 fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
@@ -157,6 +181,9 @@ struct EnvConfig {
     cache_ttl: Option<String>,
     not_found_cache_ttl: Option<String>,
     html_cache_ttl: Option<String>,
+    backend_retry_max: u32,
+    backend_timeout: Option<String>,
+    backend_io_timeout: Option<String>,
     not_modified: bool,
     precompressed: bool,
     access_log: bool,
@@ -195,6 +222,9 @@ impl Default for EnvConfig {
             cache_ttl: None,
             not_found_cache_ttl: None,
             html_cache_ttl: None,
+            backend_retry_max: 0,
+            backend_timeout: None,
+            backend_io_timeout: None,
             not_modified: false,
             precompressed: false,
             access_log: true,
@@ -325,6 +355,15 @@ impl Config {
             html_cache_ttl: parse_short_cache_ttl_or_exit(
                 "STATIC_HTML_CACHE_TTL",
                 env_cfg.html_cache_ttl.as_deref(),
+            ),
+            backend_retry_max: env_cfg.backend_retry_max,
+            backend_timeout: parse_optional_duration_or_exit(
+                "STATIC_BACKEND_TIMEOUT",
+                env_cfg.backend_timeout.as_deref(),
+            ),
+            backend_io_timeout: parse_optional_duration_or_exit(
+                "STATIC_BACKEND_IO_TIMEOUT",
+                env_cfg.backend_io_timeout.as_deref(),
             ),
             not_modified: env_cfg.not_modified,
             precompressed: env_cfg.precompressed,

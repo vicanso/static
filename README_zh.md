@@ -127,6 +127,16 @@ docker run -d --restart=always \
 | `LOG_LEVEL` | `INFO` | 日志级别：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` |
 | `LOG_FORMAT` | `text` | 日志输出格式：`text` 或 `json` |
 
+### 后端弹性（Backend Resilience）
+
+针对存储后端的 opendal 层级重试/超时，默认全部关闭。面向远程后端（S3/FTP/GridFS）—— 单次操作可能挂起或瞬时失败；本地 FS 下这些层永不触发。它们约束的是**单个后端操作**，与 `STATIC_TIMEOUT`（整请求截止时间）相互独立 —— 应设为其零头，使重试能在请求预算内跑完。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `STATIC_BACKEND_RETRY_MAX` | `0`（关闭） | 瞬时后端错误的重试次数（opendal `RetryLayer`，指数退避）。`0` 表示不重试。建议与 `STATIC_BACKEND_IO_TIMEOUT` 同时启用，使挂起的连接转化为可重试的超时。 |
+| `STATIC_BACKEND_TIMEOUT` | —（关闭） | 非流式操作（如 `stat`）的单次超时（opendal `TimeoutLayer`）。接受时长（`5s`、`500ms`）。 |
+| `STATIC_BACKEND_IO_TIMEOUT` | —（关闭） | 流式读取（相邻 chunk 之间）的单次超时。接受时长（`10s`）。 |
+
 ## Basic 认证
 
 通过设置一个或多个 `STATIC_BASIC_AUTH_*` 变量为服务器启用 HTTP Basic Auth。`<NAME>` 后缀为任意标识符，用于区分多个账号。

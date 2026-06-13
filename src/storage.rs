@@ -15,12 +15,16 @@
 use crate::error::Error;
 #[cfg(any(feature = "s3", feature = "ftp", feature = "gridfs"))]
 use opendal::Builder;
-use opendal::{Operator, layers::MimeGuessLayer};
+use opendal::{
+    Operator,
+    layers::{MimeGuessLayer, RetryLayer, TimeoutLayer},
+};
 use path_absolutize::Absolutize;
 #[cfg(any(feature = "s3", feature = "ftp"))]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::{error, info};
 #[cfg(any(feature = "s3", feature = "ftp"))]
 use url::Url;
@@ -45,6 +49,69 @@ fn skip_symlink_check() -> bool {
             }
         }
     })
+}
+
+// opendal backend resilience layers (RetryLayer / TimeoutLayer), configured in
+// config.rs and injected here once at startup via `init_backend_resilience`.
+// All off unless set, so local-FS setups are unaffected; they matter for remote
+// backends (S3/FTP/GridFS) where a single op can hang or transiently fail.
+struct BackendResilience {
+    retry_max: u32,
+    timeout: Option<Duration>,
+    io_timeout: Option<Duration>,
+}
+
+static BACKEND_RESILIENCE: OnceLock<BackendResilience> = OnceLock::new();
+
+// Wire the parsed config in before the server starts. First call wins; if never
+// called (e.g. a unit test that builds an operator) `apply_resilience` is a
+// no-op and the operator is built exactly as before.
+pub fn init_backend_resilience(
+    retry_max: u32,
+    timeout: Option<Duration>,
+    io_timeout: Option<Duration>,
+) {
+    let _ = BACKEND_RESILIENCE.set(BackendResilience {
+        retry_max,
+        timeout,
+        io_timeout,
+    });
+    if let Some(cfg) = BACKEND_RESILIENCE.get()
+        && (cfg.retry_max > 0 || cfg.timeout.is_some() || cfg.io_timeout.is_some())
+    {
+        info!(
+            retry_max = cfg.retry_max,
+            timeout = ?cfg.timeout,
+            io_timeout = ?cfg.io_timeout,
+            "backend resilience layers enabled"
+        );
+    }
+}
+
+// Wrap a finished operator with the configured resilience layers. TimeoutLayer
+// is applied first so it sits *inside* RetryLayer — opendal requires this order
+// (a timeout drops the inner attempt's future; if it wrapped retry instead it
+// would corrupt the retry state). Each retry attempt is then independently
+// bounded. `Operator::layer` is type-erased (returns Operator), so the layers
+// can be attached conditionally.
+fn apply_resilience(mut dal: Operator) -> Operator {
+    let Some(cfg) = BACKEND_RESILIENCE.get() else {
+        return dal;
+    };
+    if cfg.timeout.is_some() || cfg.io_timeout.is_some() {
+        let mut layer = TimeoutLayer::new();
+        if let Some(t) = cfg.timeout {
+            layer = layer.with_timeout(t);
+        }
+        if let Some(t) = cfg.io_timeout {
+            layer = layer.with_io_timeout(t);
+        }
+        dal = dal.layer(layer);
+    }
+    if cfg.retry_max > 0 {
+        dal = dal.layer(RetryLayer::new().with_max_times(cfg.retry_max as usize));
+    }
+    dal
 }
 
 pub struct Storage {
@@ -123,7 +190,7 @@ fn build_operator<B: Builder>(builder: B) -> Result<Operator> {
         .map_err(|e| Error::Openedal { source: e })?
         .layer(MimeGuessLayer::default())
         .finish();
-    Ok(dal)
+    Ok(apply_resilience(dal))
 }
 
 #[cfg(feature = "s3")]
@@ -241,7 +308,7 @@ pub fn get_storage() -> Result<&'static Storage> {
                     .layer(MimeGuessLayer::default())
                     .finish();
                 Ok(Storage {
-                    dal,
+                    dal: apply_resilience(dal),
                     root: Some(abs_path),
                 })
             }
