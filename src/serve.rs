@@ -320,13 +320,19 @@ fn encoding_cache_key(file: &str, encoding: &str) -> String {
     key
 }
 
-fn get_file_from_cache(file: &String, cache_size: usize) -> Option<CacheValue> {
+// Seconds since the Unix epoch. Read once per request at the `get_file` cache
+// probe and threaded through, so a request that probes several encoding keys
+// does not re-read the clock for each (up to 4 reads collapse to 1).
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn get_file_from_cache(file: &String, cache_size: usize, now_secs: u64) -> Option<CacheValue> {
     if let Some(info) = get_static_cache(cache_size).get(file)
-        && info.expired_at
-            > SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
+        && info.expired_at > now_secs
     {
         return Some(info.data.clone());
     }
@@ -345,11 +351,7 @@ fn cached_result(hit: CacheValue, file: &str) -> Result<Arc<FileInfo>> {
 }
 
 fn set_file_to_cache(key: String, value: CacheValue, cache_size: usize, cache_ttl: Duration) {
-    let expired_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        + cache_ttl.as_secs();
+    let expired_at = now_unix_secs() + cache_ttl.as_secs();
     let cache = get_static_cache(cache_size);
     // The caller already built the owned key (`encoding_cache_key`); take it by
     // value so we don't clone it again here.
@@ -465,12 +467,15 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         key.push_str(&file);
         key.push('\u{0}');
         let prefix_len = key.len();
+        // Read the clock once for the whole probe sequence: every key shares the
+        // same expiry cutoff, and the probes run within microseconds.
+        let now_secs = now_unix_secs();
         if let Some(prefs) = &accept_prefs {
             for enc in ["br", "zstd", "gzip"] {
                 if prefs.accepts(enc) {
                     key.truncate(prefix_len);
                     key.push_str(enc);
-                    if let Some(hit) = get_file_from_cache(&key, params.cache_size) {
+                    if let Some(hit) = get_file_from_cache(&key, params.cache_size, now_secs) {
                         metrics::record_cache_hit();
                         return cached_result(hit, &file);
                     }
@@ -481,7 +486,7 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         // entries live only under this key, so they are reached regardless of
         // what the client accepts.
         key.truncate(prefix_len);
-        if let Some(hit) = get_file_from_cache(&key, params.cache_size) {
+        if let Some(hit) = get_file_from_cache(&key, params.cache_size, now_secs) {
             metrics::record_cache_hit();
             return cached_result(hit, &file);
         }
@@ -1451,8 +1456,9 @@ mod tests {
             size,
             Duration::from_secs(60),
         );
+        let now = now_unix_secs();
         assert!(matches!(
-            get_file_from_cache(&"missing.js\u{0}".to_string(), size),
+            get_file_from_cache(&"missing.js\u{0}".to_string(), size, now),
             Some(CacheValue::NotFound)
         ));
         // ...and a negative hit replays a not-found error
@@ -1473,7 +1479,7 @@ mod tests {
             size,
             Duration::from_secs(60),
         );
-        match get_file_from_cache(&"a.js\u{0}".to_string(), size) {
+        match get_file_from_cache(&"a.js\u{0}".to_string(), size, now) {
             Some(CacheValue::Found(got)) => assert_eq!(got.size, 1),
             _ => panic!("expected a positive cache hit"),
         }
@@ -1485,7 +1491,7 @@ mod tests {
             size,
             Duration::ZERO,
         );
-        assert!(get_file_from_cache(&"expired\u{0}".to_string(), size).is_none());
+        assert!(get_file_from_cache(&"expired\u{0}".to_string(), size, now_unix_secs()).is_none());
     }
 
     #[test]
