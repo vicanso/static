@@ -19,7 +19,7 @@ ftp = ["opendal/services-ftp"]
 gridfs = ["opendal/services-gridfs"]
 
 [dependencies]
-TinyUFO = "0.8.0"
+TinyUFO = "0.8.1"
 aho-corasick = "1.1.4"
 axum = "0.8.9"
 bytes = "1.11.1"
@@ -33,13 +33,13 @@ humantime = "2.3.0"
 mime_guess = "2.0.5"
 mimalloc = "0.1.52"
 num_cpus = "1.17.0"
-opendal = { version = "0.56.0", features = [
+opendal = { version = "0.57.0", features = [
     "services-fs",
     "layers-mime-guess",
 ] }
 path-absolutize = "3.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
-snafu = "0.9.0"
+snafu = "0.9.1"
 time = "0.3.47"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }

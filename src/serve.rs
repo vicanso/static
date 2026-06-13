@@ -537,6 +537,19 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     res
 }
 
+// Join a directory path and an index filename, inserting a single '/' only when
+// the directory part lacks a trailing one. Shared by the optimistic index probe
+// and the directory fallback so both target byte-identical backend keys (the
+// empty/root dir yields a leading-slash `/index.html`, matching the historical
+// join).
+fn join_index(dir: &str, index: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{index}")
+    } else {
+        format!("{dir}/{index}")
+    }
+}
+
 async fn load_file(
     params: &StaticServeParams,
     mut file: String,
@@ -545,11 +558,42 @@ async fn load_file(
     let storage = get_storage()?;
     storage.validate(&file)?;
 
-    let mut meta = storage
-        .dal
-        .stat(&file)
-        .await
-        .map_err(|e| Error::Openedal { source: e })?;
+    // Optimistic index resolution. For a trailing-slash directory request with
+    // autoindex off and an index file configured, `<dir>/<index>` almost always
+    // exists and the directory's own metadata is then thrown away. Stat the
+    // index directly: on a hit we skip the separate directory stat entirely (one
+    // backend round-trip instead of two — significant on remote backends like
+    // S3/FTP/GridFS, negligible on local FS). The trailing-slash guard is also a
+    // correctness condition: a directory reached *without* the slash must 301
+    // first (below), which requires stat'ing the directory itself. On a NotFound
+    // miss we fall back to the normal directory stat and skip re-probing the
+    // index (`index_missing`); a non-NotFound error is the only servable target
+    // failing, so it propagates rather than masking a 5xx as a 404.
+    let mut index_meta = None;
+    let mut index_missing = false;
+    if params.request_path.ends_with('/') && !params.autoindex && !params.index.is_empty() {
+        let index_path = join_index(&file, &params.index);
+        match storage.dal.stat(&index_path).await {
+            Ok(m) if m.is_file() => {
+                file = index_path;
+                index_meta = Some(m);
+            }
+            // Index path is itself a directory (rare): fall back to the normal
+            // directory handling below, which resolves it as it does today.
+            Ok(_) => {}
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => index_missing = true,
+            Err(e) => return Err(Error::Openedal { source: e }),
+        }
+    }
+
+    let mut meta = match index_meta {
+        Some(m) => m,
+        None => storage
+            .dal
+            .stat(&file)
+            .await
+            .map_err(|e| Error::Openedal { source: e })?,
+    };
 
     let is_dir = meta.is_dir();
     if is_dir && !params.autoindex && params.index.is_empty() {
@@ -589,11 +633,13 @@ async fn load_file(
         return Ok(Arc::new(info));
     }
     if is_dir && !params.index.is_empty() {
-        file = if file.ends_with("/") {
-            format!("{file}{}", params.index)
-        } else {
-            format!("{file}/{}", params.index)
-        };
+        // The optimistic probe above already found the index absent — the
+        // directory exists but has nothing servable (autoindex is off here), so
+        // 404 directly instead of stat'ing the same missing index a second time.
+        if index_missing {
+            return Err(Error::NotFound { file: file.clone() });
+        }
+        file = join_index(&file, &params.index);
         meta = storage
             .dal
             .stat(&file)
@@ -1369,6 +1415,19 @@ mod tests {
         assert!(!mixed.accepts("gzip")); // no wildcard, so gzip is unaccepted
         // first occurrence wins: an initial q=0 refusal is not overridden
         assert!(!EncodingPrefs::parse("br;q=0, br;q=1").accepts("br"));
+    }
+
+    #[test]
+    fn join_index_inserts_single_slash() {
+        // a trailing slash is not doubled
+        assert_eq!(join_index("foo/", "index.html"), "foo/index.html");
+        // a missing slash is inserted
+        assert_eq!(join_index("foo", "index.html"), "foo/index.html");
+        // nested dirs keep their interior slashes
+        assert_eq!(join_index("a/b/", "index.html"), "a/b/index.html");
+        // the root (empty dir) keeps parity with the historical join: the
+        // optimistic probe and the fallback must target the same key.
+        assert_eq!(join_index("", "index.html"), "/index.html");
     }
 
     #[test]
