@@ -952,7 +952,15 @@ async fn build_multipart_byteranges(
         .and_then(|(_, v)| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let mut buf: Vec<u8> = Vec::new();
+    // Pre-size the buffer: exact range bytes plus a per-part header/boundary
+    // estimate and the closing boundary, so the common small-range case grows
+    // the Vec at most once instead of reallocating per part. ~80 covers each
+    // part's fixed literals ("--", the two header field names, the CRLFs) and
+    // the decimal digits of start/end/total_size; an over-estimate is harmless.
+    let data_len: usize = ranges.iter().map(|&(s, e)| (e - s + 1) as usize).sum();
+    let estimated =
+        data_len + ranges.len() * (boundary.len() + content_type.len() + 80) + boundary.len() + 8;
+    let mut buf: Vec<u8> = Vec::with_capacity(estimated);
     for &(start, end) in ranges {
         let part_header = format!(
             "--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{total_size}\r\n\r\n"
@@ -967,7 +975,10 @@ async fn build_multipart_byteranges(
                 .range(start..=end)
                 .await
                 .map_err(|e| Error::Openedal { source: e })?;
-            buf.extend_from_slice(&chunk.to_vec());
+            // `to_bytes()` is zero-copy on a contiguous backend chunk, so this
+            // is a single copy into `buf` — vs `to_vec()`, which allocated a
+            // throwaway Vec and copied twice.
+            buf.extend_from_slice(&chunk.to_bytes());
         }
         buf.extend_from_slice(b"\r\n");
     }
