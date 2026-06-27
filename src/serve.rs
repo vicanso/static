@@ -1180,24 +1180,26 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         Body::from_stream(stream).into_response()
     };
 
+    // Copy our computed headers onto the response, overwriting rather than
+    // appending. A buffered body's `into_response()` (Bytes/Vec) injects a
+    // default `Content-Type: application/octet-stream`, and HeaderMap's `extend`
+    // *appends* — which would leave that default beside our real value, i.e. two
+    // Content-Type headers (the octet-stream one breaks strict ES-module MIME
+    // checks, so `.mjs` fails to load). `insert` overwrites; our keys are unique.
+    //
     // Partial responses set their own Content-Length above; multipart also
     // replaces Content-Type with the envelope type and drops any representation
-    // Content-Encoding — exclude all three from the header copy here.
-    resp.headers_mut().extend(
-        file_info
-            .headers
-            .iter()
-            .filter(|(k, _)| {
-                if is_partial && *k == header::CONTENT_LENGTH {
-                    return false;
-                }
-                if is_multipart && (*k == header::CONTENT_TYPE || *k == header::CONTENT_ENCODING) {
-                    return false;
-                }
-                true
-            })
-            .cloned(),
-    );
+    // Content-Encoding — exclude all three from the copy here.
+    let resp_headers = resp.headers_mut();
+    for (k, v) in file_info.headers.iter() {
+        if is_partial && *k == header::CONTENT_LENGTH {
+            continue;
+        }
+        if is_multipart && (*k == header::CONTENT_TYPE || *k == header::CONTENT_ENCODING) {
+            continue;
+        }
+        resp_headers.insert(k, v.clone());
+    }
 
     Ok(resp)
 }
