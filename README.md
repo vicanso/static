@@ -69,13 +69,14 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_COMPRESS_MIN_LENGTH` | `256` | Minimum response size in bytes to compress (`0` disables the runtime compression layer entirely) |
 | `STATIC_COMPRESS_LEVEL` | `default` | Runtime compression quality: `fastest`, `best`, `default`, or an integer for a precise per-algorithm level. Use `fastest` to cut CPU on high-traffic text/JS/JSON responses; prefer `STATIC_PRECOMPRESSED` to avoid runtime compression altogether. |
 | `STATIC_PRECOMPRESSED` | `false` | Serve `.br` / `.zst` / `.gz` siblings (e.g. `app.js.br` for `app.js`) when the client supports the encoding, skipping runtime compression. Negotiation is `q`-value aware (a `br;q=0` is honored as a refusal). Negotiated responses are cached per-encoding, so a repeat hit serves straight from memory. |
+| `STATIC_COMPRESS_CACHE` | `false` | Compress cacheable buffered responses once (same encoders and level as the runtime layer) and store the compressed bytes in the in-memory cache per encoding — repeat hits skip re-compression entirely. No build-step `.br`/`.gz` files needed; a pre-compressed sibling or backend `Content-Encoding` still wins. Requires the cache and compression to be enabled. |
 
 ### Routing & Fallback
 
 | Variable | Default | Description |
 |---|---|---|
 | `STATIC_INDEX_FILE` | `index.html` | Directory index filename |
-| `STATIC_AUTOINDEX` | `false` | Enable directory listing |
+| `STATIC_AUTOINDEX` | `false` | Enable directory listing (renders at most 10,000 entries per directory, with a truncation notice beyond that) |
 | `STATIC_FALLBACK_INDEX_404` | `false` | Serve the index file for unmatched routes (SPA mode) |
 | `STATIC_FALLBACK_HTML_404` | `false` | Retry with an appended `.html` for unmatched routes |
 | `STATIC_REDIRECT_*` | — | URL redirect rules. See [Redirect Rules](#redirect-rules). |
@@ -91,6 +92,7 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_RATE_LIMIT` | `0` | Per-IP rate limit in requests/sec (`0` disables). See [Rate Limiting](#rate-limiting). |
 | `STATIC_RATE_LIMIT_BURST` | — | Token-bucket burst capacity (defaults to `STATIC_RATE_LIMIT`) |
 | `STATIC_RATE_LIMIT_EXEMPT` | — | Comma-separated IPs / CIDRs exempt from rate limiting |
+| `STATIC_TRUST_PROXY` | — | Comma-separated trusted reverse proxy IPs / CIDRs. Unset = forwarded headers are always believed (historical behavior). An invalid entry exits at startup. See [Trusted Proxies](#trusted-proxies). |
 
 ### Content & Headers
 
@@ -136,6 +138,9 @@ opendal-level retry/timeout for the storage backend, all off by default. Aimed a
 | `STATIC_BACKEND_RETRY_MAX` | `0` (off) | Retry attempts for transient backend errors (opendal `RetryLayer`, exponential backoff). `0` disables retries. Enable `STATIC_BACKEND_IO_TIMEOUT` alongside it so a hung connection becomes a retryable timeout. |
 | `STATIC_BACKEND_TIMEOUT` | — (off) | Per-op timeout for non-streaming ops like `stat` (opendal `TimeoutLayer`). Accepts durations (`5s`, `500ms`). |
 | `STATIC_BACKEND_IO_TIMEOUT` | — (off) | Per-op timeout for streaming reads (between chunks). Accepts durations (`10s`). |
+| `STATIC_STARTUP_CHECK` | `warn` | Startup backend connectivity probe (one root `list` request). `warn` logs a failure and keeps booting; `strict` exits on failure so the orchestrator's restart backoff becomes a startup wait. |
+
+At startup the storage backend is always initialized eagerly: a configuration error in `STATIC_PATH` (unparsable URL, missing `bucket` parameter, a backend not compiled into the build) exits immediately instead of surfacing as a `500` on the first request. The connectivity probe then catches *network-class* problems (unreachable endpoint, bad credentials, missing bucket) — those can self-heal, so by default they only log an error.
 
 ## Basic Authentication
 
@@ -172,6 +177,21 @@ STATIC_IP_ALLOWLIST=192.168.0.0/16
 ```
 
 Rejected requests receive a `403`. The `/health` endpoint always bypasses IP access control.
+
+## Trusted Proxies
+
+By default the forwarded headers above are always believed, which is fine behind a load balancer you control but spoofable when the server is reachable directly — any client can send an `X-Forwarded-For` of its own choosing and bypass IP access control or rate limiting. Set `STATIC_TRUST_PROXY` to the IPs / CIDRs of your reverse proxies to verify instead of trust:
+
+```bash
+STATIC_TRUST_PROXY=10.0.0.0/8,127.0.0.1
+```
+
+With the list set:
+
+- Forwarded headers are honored only when the direct connection peer is in the list; from any other peer the socket address itself is the client IP.
+- The client IP is the **rightmost** `X-Forwarded-For` hop that is not itself a trusted proxy — so a client prepending a forged entry in front of what the proxy appends cannot spoof its address.
+
+This applies everywhere the client IP is used: IP allow/block lists, rate limiting and its exemptions, and access logs. Unlike the other IP lists, an invalid entry here exits at startup — a silently dropped proxy CIDR would distrust the real proxy and apply access control to the load balancer's address instead.
 
 ## Rate Limiting
 
@@ -239,7 +259,7 @@ Priority, highest to lowest:
 
 Two independent mechanisms:
 
-- **`404.html` in `STATIC_PATH`** — place a `404.html` file at the root of your `STATIC_PATH`. When a file is not found it is served verbatim with a `404` status. No configuration needed, and it takes precedence for 404s.
+- **`404.html` in `STATIC_PATH`** — place a `404.html` file at the root of your `STATIC_PATH`. When a file is not found it is served verbatim with a `404` status. No configuration needed, and it takes precedence for 404s. The lookup (the page body, or the fact that none exists) is cached in memory when `STATIC_NOT_FOUND_CACHE_TTL` or `STATIC_HTML_CACHE_TTL` is set (using the larger of the two), so bursts of 404s don't re-read the backend.
 - **`STATIC_ERROR_PAGE`** — a filesystem path to a custom template used for *all* error statuses (404, 403, 408, 400, 500, …). The template may contain `{{STATUS}}` and `{{REASON}}` placeholders, substituted with the status code and its reason phrase. It is resolved once at startup: if the path is set but the file cannot be read, the server logs an error and exits (it never serves with a misconfigured page). If unset, a built-in page is used.
 
 Internal error detail (e.g. raw storage errors) is never shown to clients — it is logged server-side only.
@@ -256,7 +276,8 @@ CORS is off until `STATIC_CORS_ALLOW_ORIGIN` is set. It accepts either `*` or a 
 # Allow any origin
 STATIC_CORS_ALLOW_ORIGIN=*
 
-# Allowlist — the request Origin is echoed back when it matches, with Vary: Origin
+# Allowlist — the request Origin is echoed back when it matches. Vary: Origin is
+# sent whether or not it matches, so shared caches never mix per-origin variants.
 STATIC_CORS_ALLOW_ORIGIN=https://app.example.com,https://admin.example.com
 
 # Preflight tuning

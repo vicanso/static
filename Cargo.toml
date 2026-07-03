@@ -21,9 +21,18 @@ gridfs = ["opendal/services-gridfs"]
 [dependencies]
 TinyUFO = "0.8.1"
 aho-corasick = "1.1.4"
+# Already in the tree via tower-http's compression features — used directly by
+# serve.rs to produce cached compressed bodies with the exact same encoders and
+# level mapping the CompressionLayer applies per request.
+async-compression = { version = "0.4", features = [
+    "tokio",
+    "brotli",
+    "gzip",
+    "zstd",
+] }
 axum = "0.8.9"
-bytes = "1.11.1"
-bytesize = "2.3.1"
+bytes = "1.12.0"
+bytesize = "2.4.2"
 envy = "0.4.2"
 base64 = "0.22"
 http-body = "1.0.1"
@@ -42,11 +51,11 @@ opendal = { version = "0.57.0", features = [
 path-absolutize = "3.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 snafu = "0.9.1"
-time = "0.3.47"
+time = "0.3.53"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.6.11", features = [
+tower-http = { version = "0.7.0", features = [
     "compression-br",
     "compression-gzip",
     "compression-zstd",

@@ -69,13 +69,14 @@ docker run -d --restart=always \
 | `STATIC_COMPRESS_MIN_LENGTH` | `256` | 启用压缩的最小响应字节数（设为 `0` 则完全关闭运行时压缩层） |
 | `STATIC_COMPRESS_LEVEL` | `default` | 运行时压缩质量：`fastest`、`best`、`default`，或用整数指定算法的精确级别。高流量的文本/JS/JSON 响应可用 `fastest` 降低 CPU；若想彻底免去运行时压缩，优先使用 `STATIC_PRECOMPRESSED`。 |
 | `STATIC_PRECOMPRESSED` | `false` | 当客户端支持对应编码时，直接返回 `.br` / `.zst` / `.gz` 副本（如 `app.js` 对应 `app.js.br`），跳过运行时压缩。协商遵循 `q` 值（`br;q=0` 视为明确拒绝）。协商出的响应会按编码分别缓存，重复命中直接走内存。 |
+| `STATIC_COMPRESS_CACHE` | `false` | 对可缓存的缓冲响应只压缩一次（与运行时压缩层同样的编码器和级别），并按编码把压缩后的字节存入内存缓存——重复命中完全跳过再压缩。无需构建期生成 `.br`/`.gz` 文件；预压缩副本或后端自带的 `Content-Encoding` 仍然优先。需要缓存与压缩均已启用。 |
 
 ### 路由与回退
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `STATIC_INDEX_FILE` | `index.html` | 目录索引文件名 |
-| `STATIC_AUTOINDEX` | `false` | 启用目录列表 |
+| `STATIC_AUTOINDEX` | `false` | 启用目录列表（每个目录最多渲染 10,000 条，超出部分显示截断提示） |
 | `STATIC_FALLBACK_INDEX_404` | `false` | 未匹配路由时返回索引文件（SPA 模式） |
 | `STATIC_FALLBACK_HTML_404` | `false` | 未匹配路由时尝试追加 `.html` |
 | `STATIC_REDIRECT_*` | — | URL 重定向规则。见[重定向规则](#重定向规则)。 |
@@ -91,6 +92,7 @@ docker run -d --restart=always \
 | `STATIC_RATE_LIMIT` | `0` | 每个 IP 的限流速率（请求/秒，`0` 表示关闭）。见[限流](#限流)。 |
 | `STATIC_RATE_LIMIT_BURST` | — | 令牌桶突发容量（默认等于 `STATIC_RATE_LIMIT`） |
 | `STATIC_RATE_LIMIT_EXEMPT` | — | 逗号分隔的免限流 IP / CIDR |
+| `STATIC_TRUST_PROXY` | — | 逗号分隔的可信反向代理 IP / CIDR。未设置 = 始终信任转发头（历史行为）。存在非法项时启动即退出。见[可信代理](#可信代理)。 |
 
 ### 内容与响应头
 
@@ -136,6 +138,9 @@ docker run -d --restart=always \
 | `STATIC_BACKEND_RETRY_MAX` | `0`（关闭） | 瞬时后端错误的重试次数（opendal `RetryLayer`，指数退避）。`0` 表示不重试。建议与 `STATIC_BACKEND_IO_TIMEOUT` 同时启用，使挂起的连接转化为可重试的超时。 |
 | `STATIC_BACKEND_TIMEOUT` | —（关闭） | 非流式操作（如 `stat`）的单次超时（opendal `TimeoutLayer`）。接受时长（`5s`、`500ms`）。 |
 | `STATIC_BACKEND_IO_TIMEOUT` | —（关闭） | 流式读取（相邻 chunk 之间）的单次超时。接受时长（`10s`）。 |
+| `STATIC_STARTUP_CHECK` | `warn` | 启动时的后端连通性探测（对根路径发一次 `list` 请求）。`warn` 表示失败仅记录日志并继续启动；`strict` 表示失败即退出，借编排器的重启退避实现启动等待。 |
+
+启动时存储后端总是被立即初始化：`STATIC_PATH` 的配置错误（URL 无法解析、缺少 `bucket` 参数、该后端未编译进当前构建）会直接退出，而不是等到第一个请求才报 `500`。随后的连通性探测负责捕获**网络类**问题（endpoint 不可达、凭据错误、bucket 不存在）—— 这类问题可以自愈，因此默认只记录错误日志。
 
 ## Basic 认证
 
@@ -172,6 +177,21 @@ STATIC_IP_ALLOWLIST=192.168.0.0/16
 ```
 
 被拒绝的请求收到 `403`。`/health` 端点始终绕过 IP 访问控制。
+
+## 可信代理
+
+默认情况下上述转发头会被无条件信任——部署在自己掌控的负载均衡器之后没有问题，但当服务可被直接访问时是可伪造的：任何客户端都能自带 `X-Forwarded-For`，从而绕过 IP 访问控制或限流。将 `STATIC_TRUST_PROXY` 设置为反向代理的 IP / CIDR，即可从"信任"切换为"校验"：
+
+```bash
+STATIC_TRUST_PROXY=10.0.0.0/8,127.0.0.1
+```
+
+设置后：
+
+- 仅当直连对端在列表内时才解析转发头；来自其他对端的请求直接以 socket 地址作为客户端 IP。
+- 客户端 IP 取 `X-Forwarded-For` 中**最右侧**的非可信代理跳——客户端在可信代理追加的真实 IP 前面伪造条目也无法冒充地址。
+
+该解析结果用于所有依赖客户端 IP 的功能：IP 黑白名单、限流及其豁免、访问日志。与其他 IP 列表不同，此列表存在非法项时启动即退出——静默丢弃写错的代理 CIDR 会导致真实代理不被信任，访问控制反而作用到负载均衡器的地址上。
 
 ## 限流
 
@@ -239,7 +259,7 @@ STATIC_CACHE_CONTROL_EXT_JSON=public, max-age=300
 
 两套相互独立的机制：
 
-- **`STATIC_PATH` 下的 `404.html`** —— 在 `STATIC_PATH` 根目录放置 `404.html`，文件不存在时原样返回该页面并设 `404` 状态码，无需任何配置；对 404 优先生效。
+- **`STATIC_PATH` 下的 `404.html`** —— 在 `STATIC_PATH` 根目录放置 `404.html`，文件不存在时原样返回该页面并设 `404` 状态码，无需任何配置；对 404 优先生效。设置了 `STATIC_NOT_FOUND_CACHE_TTL` 或 `STATIC_HTML_CACHE_TTL`（取两者较大值）时，该查询结果（页面内容或"不存在"这一事实）会缓存在内存中，突发的 404 不会反复读后端。
 - **`STATIC_ERROR_PAGE`** —— 指向一个自定义模板的文件系统路径，适用于*所有*错误状态（404/403/408/400/500…）。模板可包含 `{{STATUS}}` 和 `{{REASON}}` 占位符，分别替换为状态码与原因短语。启动时解析一次：若设置了路径但文件读取失败，服务器记录错误并退出（绝不带错误配置的页面运行）；未设置时使用内置页面。
 
 内部错误细节（如存储层原始错误）不会暴露给客户端，仅记录在服务端日志。
@@ -256,7 +276,8 @@ STATIC_CACHE_CONTROL_EXT_JSON=public, max-age=300
 # 允许任意来源
 STATIC_CORS_ALLOW_ORIGIN=*
 
-# 白名单——命中时回显请求的 Origin，并附带 Vary: Origin
+# 白名单——命中时回显请求的 Origin。无论是否命中都会附带 Vary: Origin，
+# 确保共享缓存不会混淆按 Origin 区分的响应变体
 STATIC_CORS_ALLOW_ORIGIN=https://app.example.com,https://admin.example.com
 
 # 预检调优

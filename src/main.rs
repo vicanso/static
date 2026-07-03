@@ -26,9 +26,9 @@ use axum::routing::get;
 use axum::{Router, middleware::Next};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use config::Config;
+use config::{Config, StartupCheck};
 use mimalloc::MiMalloc;
-use serve::{StaticServeParams, static_serve};
+use serve::{StaticServeParams, not_found_page, static_serve};
 
 // Route all allocations through mimalloc. On alloc/free-heavy workloads
 // (header maps, Bytes, cache misses) this typically shaves a few percent off
@@ -36,16 +36,18 @@ use serve::{StaticServeParams, static_serve};
 // processes. Drop-in: no API surface changes.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+use ipnet::IpNet;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{Predicate, SizeAbove};
-use tracing::{Level, info};
+use tracing::{Level, error, info};
 use tracing_subscriber::FmtSubscriber;
 
 mod config;
@@ -58,10 +60,11 @@ mod storage;
 static HEALTH_CHECK_RUNNING: AtomicBool = AtomicBool::new(true);
 
 // Compression predicate: a default-deny whitelist of well-compressing content
-// types, and never compress partial/range responses (compressing them would
-// corrupt Content-Range / Content-Length and break range semantics).
-// Pre-compressed `.br`/`.gz` already carry Content-Encoding so tower-http
-// skips them regardless.
+// types (shared with serve.rs's cached-compression path via
+// `is_compressible_content_type`), and never compress partial/range responses
+// (compressing them would corrupt Content-Range / Content-Length and break
+// range semantics). Pre-compressed `.br`/`.gz` already carry Content-Encoding
+// so tower-http skips them regardless.
 #[derive(Clone, Copy)]
 struct Compressible;
 
@@ -78,15 +81,7 @@ impl Predicate for Compressible {
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        content_type.starts_with("text/")
-            || content_type.starts_with("application/javascript")
-            || content_type.starts_with("application/json")
-            || content_type.starts_with("application/manifest+json")
-            || content_type.starts_with("application/xml")
-            || content_type.starts_with("application/rss+xml")
-            || content_type.starts_with("application/atom+xml")
-            || content_type.starts_with("application/wasm")
-            || content_type.starts_with("image/svg+xml")
+        serve::is_compressible_content_type(content_type)
     }
 }
 
@@ -125,6 +120,35 @@ async fn shutdown_signal(delay: Duration) {
 }
 
 async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Fail fast on backend misconfiguration. Operator construction is pure
+    // config validation (bad STATIC_PATH URL, missing bucket param, backend not
+    // compiled into this build) and does no I/O — without this call
+    // get_storage() stays lazy, so a bad config would boot fine, pass /health,
+    // and then 500 on every request.
+    let storage = match storage::get_storage() {
+        Ok(storage) => storage,
+        Err(e) => {
+            error!(error = %e, "storage initialization failed");
+            std::process::exit(1)
+        }
+    };
+    // Active connectivity probe (`check()` = one root list request): surfaces
+    // unreachable endpoints, bad credentials, and missing buckets now instead
+    // of on the first request. Unlike config errors these can self-heal, so the
+    // default (warn) logs loudly and keeps booting; STATIC_STARTUP_CHECK=strict
+    // exits, turning the orchestrator's restart backoff into a startup wait.
+    if let Err(e) = storage.dal.check().await {
+        match config.startup_check {
+            StartupCheck::Strict => {
+                error!(error = %e, "backend connectivity check failed");
+                std::process::exit(1)
+            }
+            StartupCheck::Warn => {
+                error!(error = %e, "backend connectivity check failed; continuing startup");
+            }
+        }
+    }
+
     let mut router = Router::new().route("/health", get(health_check));
     if config.metrics_enabled {
         router = router.route("/metrics", get(metrics_handler));
@@ -173,6 +197,40 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
 #[derive(Debug, Clone, Copy)]
 pub struct ClientIp(pub IpAddr);
 
+// Trusted reverse proxies (STATIC_TRUST_PROXY), injected once at startup like
+// rate_limit::init — the ClientIp extractor also runs inside `from_fn`
+// middleware (access_log), whose state is `()`, so it cannot reach Arc<Config>.
+// Empty/unset keeps the historical trust-all behavior.
+static TRUST_PROXY: OnceLock<Vec<IpNet>> = OnceLock::new();
+
+fn init_trust_proxy(list: &[IpNet]) {
+    let _ = TRUST_PROXY.set(list.to_vec());
+}
+
+fn is_trusted_proxy(trusted: &[IpNet], ip: &IpAddr) -> bool {
+    trusted.iter().any(|net| net.contains(ip))
+}
+
+// Walk X-Forwarded-For right-to-left and return the first hop that is not a
+// trusted proxy — the leftmost values are client-supplied, so taking the first
+// entry would let a client prepend a forged IP even behind a trusted proxy.
+// If every hop is trusted (an internal call chain), the nearest verified hop
+// is returned; a malformed hop stops the walk the same way, since everything
+// left of it is unverifiable.
+fn client_ip_from_xff(xff: &str, trusted: &[IpNet]) -> Option<IpAddr> {
+    let mut nearest_verified = None;
+    for part in xff.split(',').rev() {
+        let Ok(ip) = part.trim().parse::<IpAddr>() else {
+            return nearest_verified;
+        };
+        if !is_trusted_proxy(trusted, &ip) {
+            return Some(ip);
+        }
+        nearest_verified = Some(ip);
+    }
+    nearest_verified
+}
+
 impl<S> FromRequestParts<S> for ClientIp
 where
     S: Sync,
@@ -183,6 +241,33 @@ where
         parts: &mut Parts,
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
+        let trusted = TRUST_PROXY.get().map(Vec::as_slice).unwrap_or(&[]);
+        if !trusted.is_empty() {
+            // Verified mode: forwarded headers count only when the direct peer
+            // is a trusted proxy; otherwise the socket address is the client.
+            let peer = parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| addr.ip())
+                .ok_or(Error::Unknown)?;
+            if !is_trusted_proxy(trusted, &peer) {
+                return Ok(ClientIp(peer));
+            }
+            if let Some(xff) = parts.headers.get("X-Forwarded-For")
+                && let Ok(xff) = xff.to_str()
+                && let Some(ip) = client_ip_from_xff(xff, trusted)
+            {
+                return Ok(ClientIp(ip));
+            }
+            if let Some(x_real_ip) = parts.headers.get("X-Real-Ip")
+                && let Ok(ip) = x_real_ip.to_str().unwrap_or_default().parse::<IpAddr>()
+            {
+                return Ok(ClientIp(ip));
+            }
+            return Ok(ClientIp(peer));
+        }
+
+        // Historical (trust-all) behavior when STATIC_TRUST_PROXY is unset.
         if let Some(x_forwarded_for) = parts.headers.get("X-Forwarded-For")
             && let Some(ip) = x_forwarded_for
                 .to_str()
@@ -284,19 +369,31 @@ fn method_not_allowed() -> Response {
     resp
 }
 
-// Resolve the `Access-Control-Allow-Origin` value for a request.
-// Returns `(header_value, needs_vary_origin)`, or `None` when CORS is off or
-// the origin is not allowed.
-fn cors_origin(config: &Config, origin: Option<&str>) -> Option<(String, bool)> {
-    let allow = config.cors_allow_origin.as_deref()?.trim();
+// Resolve the `Access-Control-Allow-Origin` value and whether the response
+// varies by the request `Origin`. Returns `(acao, vary_origin)`; `acao` is
+// `None` when CORS is off or this request's origin is not allowed.
+// `vary_origin` reflects whether the *decision* depends on the request origin
+// — including when this request did not match. Without `Vary: Origin` on the
+// non-matching response, a shared cache could store the header-less rejection
+// and replay it to an allowed origin (or hand one origin's ACAO to another).
+fn cors_origin(
+    allow_origin: Option<&str>,
+    allow_credentials: bool,
+    origin: Option<&str>,
+) -> (Option<String>, bool) {
+    let Some(allow) = allow_origin else {
+        return (None, false);
+    };
+    let allow = allow.trim();
     if allow == "*" {
         // "*" is invalid alongside credentials — echo the request origin.
-        if config.cors_allow_credentials {
-            return origin.map(|o| (o.to_string(), true));
+        if allow_credentials {
+            return (origin.map(str::to_string), true);
         }
-        return Some(("*".to_string(), false));
+        return (Some("*".to_string()), false);
     }
     let mut first = None;
+    let mut matched = None;
     let mut count = 0usize;
     for item in allow.split(',') {
         let item = item.trim();
@@ -307,15 +404,16 @@ fn cors_origin(config: &Config, origin: Option<&str>) -> Option<(String, bool)> 
         if first.is_none() {
             first = Some(item.to_string());
         }
-        if origin == Some(item) {
-            return Some((item.to_string(), true));
+        if matched.is_none() && origin == Some(item) {
+            matched = Some(item.to_string());
         }
     }
-    // A single fixed origin is always advertised (no per-request variance).
+    // A single fixed origin is always advertised (no per-request variance),
+    // whether or not this request's origin equals it.
     if count == 1 {
-        return first.map(|o| (o, false));
+        return (first, false);
     }
-    None
+    (matched, count > 1)
 }
 
 // Apply custom response headers, the nosniff default, and CORS headers to a
@@ -330,7 +428,18 @@ fn apply_common_headers(resp: &mut Response, config: &Config, origin: Option<&st
             HeaderValue::from_static("nosniff"),
         );
     }
-    if let Some((acao, vary_origin)) = cors_origin(config, origin) {
+    let (acao, vary_origin) = cors_origin(
+        config.cors_allow_origin.as_deref(),
+        config.cors_allow_credentials,
+        origin,
+    );
+    // Vary applies whenever the config is origin-dependent, even on a
+    // non-matching request whose response carries no ACAO at all.
+    if vary_origin {
+        resp.headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Origin"));
+    }
+    if let Some(acao) = acao {
         if let Ok(v) = HeaderValue::try_from(acao) {
             resp.headers_mut()
                 .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
@@ -340,10 +449,6 @@ fn apply_common_headers(resp: &mut Response, config: &Config, origin: Option<&st
                 header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
                 HeaderValue::from_static("true"),
             );
-        }
-        if vary_origin {
-            resp.headers_mut()
-                .append(header::VARY, HeaderValue::from_static("Origin"));
         }
     }
 }
@@ -497,7 +602,11 @@ async fn serve(
     } else {
         None
     };
-    let accept_encoding: Option<Arc<str>> = if config.precompressed {
+    // Accept-Encoding feeds both pre-compressed sibling negotiation and cached
+    // dynamic compression; compress_cache is meaningless with compression off
+    // (compress_min_length == 0 removes the layer entirely).
+    let compress_cache = config.compress_cache && config.compress_min_length > 0;
+    let accept_encoding: Option<Arc<str>> = if config.precompressed || compress_cache {
         req_headers
             .get(header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok())
@@ -526,6 +635,10 @@ async fn serve(
         if_none_match,
         if_modified_since,
         accept_encoding,
+        precompressed: config.precompressed,
+        compress_cache,
+        compress_min_length: config.compress_min_length,
+        compress_level: config.compress_level,
         read_max_size: config.read_max_size,
         head: is_head,
         request_path: Arc::from(path),
@@ -552,12 +665,15 @@ async fn serve(
             Err(e) => return Err(e),
         }
     }
-    // Try serving custom error page (e.g., 404.html)
+    // Try serving custom error page (404.html in the storage root). The lookup
+    // — page body or its absence — is cached by serve::not_found_page whenever
+    // either short-cache TTL opted in, so path-scanning bots don't turn every
+    // 404 into a backend round trip.
     if last_err.is_not_found()
-        && let Ok(storage) = storage::get_storage()
-        && let Ok(buf) = storage.dal.read("404.html").await
+        && let Some(body) =
+            not_found_page(config.not_found_cache_ttl.max(config.html_cache_ttl)).await
     {
-        let mut resp = buf.to_vec().into_response();
+        let mut resp = body.into_response();
         *resp.status_mut() = StatusCode::NOT_FOUND;
         resp.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -612,6 +728,7 @@ fn main() {
     let config = Arc::new(Config::new());
     init_error_template(config.error_page.as_deref());
     rate_limit::init(config.rate_limit, config.rate_limit_burst);
+    init_trust_proxy(&config.trust_proxy);
     storage::init_backend_resilience(
         config.backend_retry_max,
         config.backend_timeout,
@@ -629,4 +746,134 @@ fn main() {
         .build()
         .unwrap_or_else(|e| panic!("failed to build tokio runtime: {}", e))
         .block_on(run(config));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nets(items: &[&str]) -> Vec<IpNet> {
+        items
+            .iter()
+            .map(|s| {
+                s.parse::<IpNet>()
+                    .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
+                    .expect("valid test net")
+            })
+            .collect()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("valid test ip")
+    }
+
+    #[test]
+    fn xff_returns_rightmost_untrusted_hop() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        // proxy appended the real client after the client's own (forged) entry:
+        // the rightmost untrusted hop wins, not the leftmost value
+        assert_eq!(
+            client_ip_from_xff("8.8.8.8, 203.0.113.7, 10.0.0.2", &trusted),
+            Some(ip("203.0.113.7"))
+        );
+        // single untrusted hop
+        assert_eq!(
+            client_ip_from_xff("203.0.113.7", &trusted),
+            Some(ip("203.0.113.7"))
+        );
+    }
+
+    #[test]
+    fn xff_all_trusted_returns_nearest_verified() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        // an internal call chain: every hop is a trusted proxy — return the
+        // furthest verified hop rather than nothing
+        assert_eq!(
+            client_ip_from_xff("10.0.0.1, 10.0.0.2", &trusted),
+            Some(ip("10.0.0.1"))
+        );
+    }
+
+    #[test]
+    fn xff_malformed_hop_stops_the_walk() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        // garbage left of a trusted hop: everything past it is unverifiable,
+        // so the nearest verified hop is returned
+        assert_eq!(
+            client_ip_from_xff("garbage, 10.0.0.2", &trusted),
+            Some(ip("10.0.0.2"))
+        );
+        // garbage in the rightmost slot: nothing is verifiable at all
+        assert_eq!(client_ip_from_xff("garbage", &trusted), None);
+        assert_eq!(client_ip_from_xff("", &trusted), None);
+    }
+
+    #[test]
+    fn cors_origin_wildcard() {
+        // "*" without credentials never varies
+        assert_eq!(
+            cors_origin(Some("*"), false, Some("https://a.com")),
+            (Some("*".to_string()), false)
+        );
+        // "*" with credentials echoes the request origin and always varies —
+        // even when no Origin was sent (the header-less response must not be
+        // cached as the canonical variant)
+        assert_eq!(
+            cors_origin(Some("*"), true, Some("https://a.com")),
+            (Some("https://a.com".to_string()), true)
+        );
+        assert_eq!(cors_origin(Some("*"), true, None), (None, true));
+    }
+
+    #[test]
+    fn cors_origin_single_fixed_origin_never_varies() {
+        let allow = Some("https://a.com");
+        // always advertised, matching or not
+        assert_eq!(
+            cors_origin(allow, false, Some("https://a.com")),
+            (Some("https://a.com".to_string()), false)
+        );
+        assert_eq!(
+            cors_origin(allow, false, Some("https://evil.com")),
+            (Some("https://a.com".to_string()), false)
+        );
+        assert_eq!(
+            cors_origin(allow, false, None),
+            (Some("https://a.com".to_string()), false)
+        );
+    }
+
+    #[test]
+    fn cors_origin_multi_allowlist_always_varies() {
+        let allow = Some("https://a.com, https://b.com");
+        // a match echoes the origin and varies
+        assert_eq!(
+            cors_origin(allow, false, Some("https://b.com")),
+            (Some("https://b.com".to_string()), true)
+        );
+        // a non-match still varies: the ACAO-less rejection is origin-dependent
+        // and must not be cached as the response for every origin
+        assert_eq!(
+            cors_origin(allow, false, Some("https://evil.com")),
+            (None, true)
+        );
+        assert_eq!(cors_origin(allow, false, None), (None, true));
+    }
+
+    #[test]
+    fn cors_origin_disabled() {
+        assert_eq!(
+            cors_origin(None, false, Some("https://a.com")),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_matching_covers_cidrs_and_single_ips() {
+        let trusted = nets(&["10.0.0.0/8", "192.0.2.1"]);
+        assert!(is_trusted_proxy(&trusted, &ip("10.1.2.3")));
+        assert!(is_trusted_proxy(&trusted, &ip("192.0.2.1")));
+        assert!(!is_trusted_proxy(&trusted, &ip("192.0.2.2")));
+        assert!(!is_trusted_proxy(&[], &ip("10.1.2.3")));
+    }
 }

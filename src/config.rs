@@ -23,11 +23,29 @@ use std::time::Duration;
 use tower_http::compression::CompressionLevel;
 use tracing::{error, warn};
 
+// What to do when the startup backend connectivity probe (`Operator::check()`,
+// one root `list` request) fails. Config errors always exit regardless — this
+// only governs *network-class* failures (unreachable endpoint, bad credentials),
+// which can self-heal: `Warn` logs loudly and keeps booting (requests would
+// fail identically anyway until the backend recovers); `Strict` exits, turning
+// the orchestrator's restart backoff into a startup wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupCheck {
+    Warn,
+    Strict,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub timeout: Duration,
-    pub compress_min_length: u16,
+    pub compress_min_length: u64,
     pub compress_level: CompressionLevel,
+    // Opt-in: compress cacheable buffered bodies once in serve.rs (same
+    // encoders/levels as the CompressionLayer) and store them under the
+    // encoding-aware cache key, so hot files aren't re-compressed per request.
+    // Only meaningful when compression (compress_min_length > 0) and the
+    // in-memory cache are both on.
+    pub compress_cache: bool,
     pub index_file: Arc<str>,
     pub autoindex: bool,
     pub listen_addr: String,
@@ -47,6 +65,13 @@ pub struct Config {
     pub rate_limit: u32,
     pub rate_limit_burst: u32,
     pub rate_limit_exempt: Arc<Vec<IpNet>>,
+    // Trusted reverse proxies (IPs/CIDRs). Empty (the default) preserves the
+    // historical behavior: X-Forwarded-For / X-Real-Ip are always believed.
+    // Non-empty opts into verification: forwarded headers are honored only when
+    // the direct peer is in this list, and the client IP is the rightmost
+    // X-Forwarded-For hop that is NOT itself a trusted proxy — so a client
+    // prepending a forged XFF cannot spoof IP access control or rate limiting.
+    pub trust_proxy: Arc<Vec<IpNet>>,
     pub basic_auth: Arc<HashSet<String>>,
     pub basic_auth_realm: String,
     pub error_page: Option<String>,
@@ -67,6 +92,7 @@ pub struct Config {
     pub backend_retry_max: u32,
     pub backend_timeout: Option<Duration>,
     pub backend_io_timeout: Option<Duration>,
+    pub startup_check: StartupCheck,
     pub not_modified: bool,
     pub precompressed: bool,
     pub access_log: bool,
@@ -150,6 +176,22 @@ fn parse_optional_duration_or_exit(name: &str, raw: Option<&str>) -> Option<Dura
     }
 }
 
+// Parse STATIC_STARTUP_CHECK. Absent/empty -> Warn (probe runs, failure only
+// logs); `strict` -> exit on probe failure; anything else -> log and exit.
+fn parse_startup_check_or_exit(raw: Option<&str>) -> StartupCheck {
+    match raw {
+        None => StartupCheck::Warn,
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "" | "warn" => StartupCheck::Warn,
+            "strict" => StartupCheck::Strict,
+            other => {
+                error!("Invalid STATIC_STARTUP_CHECK={other}: expected warn or strict");
+                std::process::exit(1)
+            }
+        },
+    }
+}
+
 // Parse an optional byte size from env. Absent -> default;
 // present but invalid -> log and exit.
 fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
@@ -169,8 +211,9 @@ fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
 #[serde(default)]
 struct EnvConfig {
     timeout: Option<String>,
-    compress_min_length: u16,
+    compress_min_length: u64,
     compress_level: Option<String>,
+    compress_cache: bool,
     index_file: String,
     autoindex: bool,
     listen_addr: String,
@@ -184,6 +227,7 @@ struct EnvConfig {
     backend_retry_max: u32,
     backend_timeout: Option<String>,
     backend_io_timeout: Option<String>,
+    startup_check: Option<String>,
     not_modified: bool,
     precompressed: bool,
     access_log: bool,
@@ -194,6 +238,7 @@ struct EnvConfig {
     rate_limit: u32,
     rate_limit_burst: u32,
     rate_limit_exempt: String,
+    trust_proxy: String,
     basic_auth_realm: String,
     error_page: Option<String>,
     content_type_nosniff: bool,
@@ -212,6 +257,7 @@ impl Default for EnvConfig {
             timeout: None,
             compress_min_length: 256,
             compress_level: None,
+            compress_cache: false,
             index_file: "index.html".to_string(),
             autoindex: false,
             listen_addr: "0.0.0.0:3000".to_string(),
@@ -225,6 +271,7 @@ impl Default for EnvConfig {
             backend_retry_max: 0,
             backend_timeout: None,
             backend_io_timeout: None,
+            startup_check: None,
             not_modified: false,
             precompressed: false,
             access_log: true,
@@ -235,6 +282,7 @@ impl Default for EnvConfig {
             rate_limit: 0,
             rate_limit_burst: 0,
             rate_limit_exempt: String::new(),
+            trust_proxy: String::new(),
             basic_auth_realm: "static".to_string(),
             error_page: None,
             content_type_nosniff: true,
@@ -259,6 +307,26 @@ fn parse_ip_list(s: &str) -> Vec<IpNet> {
             item.parse::<IpNet>()
                 .or_else(|_| item.parse::<IpAddr>().map(IpNet::from))
                 .ok()
+        })
+        .collect()
+}
+
+// Strict variant: any invalid entry logs and exits instead of being silently
+// dropped. Used for STATIC_TRUST_PROXY, where a typo'd CIDR quietly falling out
+// of the list would distrust the real proxy and start applying IP access
+// control / rate limiting to the load balancer's address — worse than failing
+// to boot.
+fn parse_ip_list_strict_or_exit(name: &str, s: &str) -> Vec<IpNet> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            item.parse::<IpNet>()
+                .or_else(|_| item.parse::<IpAddr>().map(IpNet::from))
+                .unwrap_or_else(|e| {
+                    error!("Invalid {name} entry {item}: {e}");
+                    std::process::exit(1)
+                })
         })
         .collect()
 }
@@ -336,6 +404,7 @@ impl Config {
             ),
             compress_min_length: env_cfg.compress_min_length,
             compress_level: parse_compress_level_or_exit(env_cfg.compress_level.as_deref()),
+            compress_cache: env_cfg.compress_cache,
             index_file: env_cfg.index_file.into(),
             autoindex: env_cfg.autoindex,
             listen_addr: env_cfg.listen_addr,
@@ -365,6 +434,7 @@ impl Config {
                 "STATIC_BACKEND_IO_TIMEOUT",
                 env_cfg.backend_io_timeout.as_deref(),
             ),
+            startup_check: parse_startup_check_or_exit(env_cfg.startup_check.as_deref()),
             not_modified: env_cfg.not_modified,
             precompressed: env_cfg.precompressed,
             access_log: env_cfg.access_log,
@@ -381,6 +451,10 @@ impl Config {
             rate_limit: env_cfg.rate_limit,
             rate_limit_burst: env_cfg.rate_limit_burst,
             rate_limit_exempt: Arc::new(parse_ip_list(&env_cfg.rate_limit_exempt)),
+            trust_proxy: Arc::new(parse_ip_list_strict_or_exit(
+                "STATIC_TRUST_PROXY",
+                &env_cfg.trust_proxy,
+            )),
             basic_auth: Arc::new(basic_auth),
             basic_auth_realm: env_cfg.basic_auth_realm,
             error_page: env_cfg.error_page,

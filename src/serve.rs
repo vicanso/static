@@ -16,6 +16,8 @@ use crate::error::{Error, Result};
 use crate::metrics;
 use crate::storage::get_storage;
 use aho_corasick::AhoCorasick;
+use async_compression::Level;
+use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder, ZstdEncoder};
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -31,9 +33,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
+use tower_http::compression::CompressionLevel;
 
 pub static X_ORIGINAL_SIZE_HEADER_NAME: HeaderName = HeaderName::from_static("x-original-size");
 
@@ -91,6 +95,53 @@ impl HtmlReplacer {
     }
 }
 
+// Content types worth compressing — a default-deny whitelist shared with the
+// on-the-fly CompressionLayer predicate (main.rs `Compressible` calls this), so
+// the cached-compression path below and the layer always agree on what is
+// compressible.
+pub fn is_compressible_content_type(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || content_type.starts_with("application/javascript")
+        || content_type.starts_with("application/json")
+        || content_type.starts_with("application/manifest+json")
+        || content_type.starts_with("application/xml")
+        || content_type.starts_with("application/rss+xml")
+        || content_type.starts_with("application/atom+xml")
+        || content_type.starts_with("application/wasm")
+        || content_type.starts_with("image/svg+xml")
+}
+
+// Compress a buffered body with the same encoder crate (async-compression) and
+// the same 1:1 level mapping tower-http applies internally, so the cached bytes
+// match what the CompressionLayer would have produced per request. Returns
+// `None` on an unknown encoding or an encoder error — callers fall back to the
+// identity body (the layer then compresses per request as before).
+async fn compress_body(encoding: &str, level: CompressionLevel, input: &[u8]) -> Option<Bytes> {
+    let level = match level {
+        CompressionLevel::Fastest => Level::Fastest,
+        CompressionLevel::Best => Level::Best,
+        CompressionLevel::Precise(q) => Level::Precise(q),
+        _ => Level::Default,
+    };
+    let mut out = Vec::with_capacity(input.len() / 3 + 64);
+    let ok = match encoding {
+        "br" => BrotliEncoder::with_quality(input, level)
+            .read_to_end(&mut out)
+            .await
+            .is_ok(),
+        "zstd" => ZstdEncoder::with_quality(input, level)
+            .read_to_end(&mut out)
+            .await
+            .is_ok(),
+        "gzip" => GzipEncoder::with_quality(input, level)
+            .read_to_end(&mut out)
+            .await
+            .is_ok(),
+        _ => false,
+    };
+    (ok && !out.is_empty()).then(|| Bytes::from(out))
+}
+
 // Static HTML template for directory listing view
 // Includes basic styling and JavaScript for date formatting
 static WEB_HTML: &str = include_str!("templates/autoindex.html");
@@ -113,13 +164,22 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+// Cap on the rows an autoindex listing renders. Listings are rebuilt per
+// request and never cached, so an unbounded directory (100k+ entries) would
+// allocate a multi-megabyte HTML body on every hit. Directories that large
+// aren't human-browsable anyway — render the first N and say so.
+const AUTOINDEX_MAX_ENTRIES: usize = 10_000;
+
 async fn get_autoindex_html(path: &str) -> Result<String> {
     let entry_list = get_storage()?
         .dal
         .list(path)
         .await
         .map_err(|e| Error::Openedal { source: e })?;
-    let mut html_rows = String::with_capacity(entry_list.len() * 128);
+    let mut html_rows =
+        String::with_capacity(entry_list.len().min(AUTOINDEX_MAX_ENTRIES) * 128 + 128);
+    let mut shown = 0usize;
+    let mut truncated = false;
     for entry in entry_list {
         let name = entry.name();
         if name.len() <= 1 || name.starts_with('.') {
@@ -130,6 +190,11 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
         if name.ends_with(".br") || name.ends_with(".gz") || name.ends_with(".zst") {
             continue;
         }
+        if shown == AUTOINDEX_MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
+        shown += 1;
 
         let meta = entry.metadata();
         let mut size = String::new();
@@ -162,7 +227,56 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
         );
     }
 
+    if truncated {
+        let _ = write!(
+            html_rows,
+            r###"<tr>
+                <td class="name">&hellip; listing truncated at {AUTOINDEX_MAX_ENTRIES} entries</td>
+                <td class="size"></td>
+                <td class="lastModified"></td>
+            </tr>"###
+        );
+    }
+
     Ok(WEB_HTML.replace("{{CONTENT}}", &html_rows))
+}
+
+// The two 304 predicates, shared verbatim between `static_serve` (which builds
+// the 304 response) and `load_file` (which uses them to skip the body read for
+// a request that is guaranteed to 304) — sharing the exact functions is what
+// makes the skip safe: the decisions cannot drift apart.
+fn if_none_match_hit(if_none_match: &str, etag: &str) -> bool {
+    if_none_match == "*" || if_none_match.split(',').any(|v| v.trim() == etag)
+}
+
+fn if_modified_since_hit(ims: &str, last_modified_secs: i64) -> bool {
+    parse_http_date(ims)
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|d| last_modified_secs <= d.as_secs() as i64)
+}
+
+// Would this request's conditional headers already guarantee a 304 against the
+// given validators? Mirrors `static_serve`'s two independent checks (ETag
+// first, then Last-Modified).
+fn conditional_not_modified(
+    params: &StaticServeParams,
+    etag: Option<&str>,
+    last_modified_secs: Option<i64>,
+) -> bool {
+    if let Some(inm) = params.if_none_match.as_deref()
+        && let Some(etag) = etag
+        && if_none_match_hit(inm, etag)
+    {
+        return true;
+    }
+    if let Some(ims) = params.if_modified_since.as_deref()
+        && let Some(lm) = last_modified_secs
+        && if_modified_since_hit(ims, lm)
+    {
+        return true;
+    }
+    false
 }
 
 // RFC 7233: a Range request guarded by `If-Range` is only honored when the
@@ -269,6 +383,17 @@ pub struct StaticServeParams {
     pub if_none_match: Option<Arc<str>>,
     pub if_modified_since: Option<Arc<str>>,
     pub accept_encoding: Option<Arc<str>>,
+    // Whether to probe `.br`/`.zst`/`.gz` sibling files (STATIC_PRECOMPRESSED).
+    // Kept separate from `accept_encoding` presence: cached dynamic compression
+    // also needs the Accept-Encoding header, but must not trigger sibling
+    // `stat` probes for files that were never pre-compressed.
+    pub precompressed: bool,
+    // Cached dynamic compression (STATIC_COMPRESS_CACHE): compress cacheable
+    // buffered bodies once with the CompressionLayer's encoders/level and store
+    // them under the encoding-aware cache key.
+    pub compress_cache: bool,
+    pub compress_min_length: u64,
+    pub compress_level: CompressionLevel,
     pub read_max_size: u64,
     pub head: bool,
     pub request_path: Arc<str>,
@@ -429,6 +554,28 @@ fn inflight() -> &'static Mutex<HashMap<String, Arc<Flight>>> {
     INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Leader-side RAII cleanup for a single-flight slot. The leader's future can be
+// dropped mid-load (client disconnected, hyper cancels the handler); without
+// the guard the key would stay in INFLIGHT forever and every later request for
+// it would follow a dead flight, hanging until the request timeout. Dropping
+// the guard removes the slot and wakes any followers — on cancellation no
+// result was published, so they fall through to an independent load.
+struct FlightGuard {
+    key: String,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if let Some(flight) = inflight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key)
+        {
+            flight.done.notify_waiters();
+        }
+    }
+}
+
 // Two requests resolve to byte-identical responses iff they share the same
 // logical path, the same set of accepted compression encodings (negotiation is
 // purely a boolean per encoding), and the same HEAD-ness (HEAD has no body).
@@ -521,23 +668,37 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         if let Some(info) = flight.result() {
             return Ok(info);
         }
-        let res = load_file(params, file, &accept_prefs).await;
+        let res = load_file(params, file, &accept_prefs)
+            .await
+            .map(|(info, _)| info);
         maybe_cache_not_found(params, &res);
         return res;
     }
 
-    // Leader: load, hand the result to any followers, then clear the slot.
+    // Leader: load, publish the result to any followers, then clear the slot.
+    // The guard owns the remove + wake so they also run if this future is
+    // dropped mid-load (client disconnect) — a cancelled leader must not leave
+    // a dead flight behind. Publish happens before the guard drops, so woken
+    // followers always observe the result.
+    let guard = FlightGuard { key: sf_key };
     let res = load_file(params, file, &accept_prefs).await;
-    if let Some(flight) = inflight()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&sf_key)
+    if let Ok((info, share)) = &res
+        && *share
     {
-        if let Ok(info) = &res {
+        // `share == false` means the body read was skipped for a guaranteed
+        // 304 — publishing that would hand followers a body-less FileInfo they
+        // would stream raw (bypassing buffering and the HTML replacer). They
+        // fall through to an independent load instead.
+        let flight = inflight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&guard.key)
+            .cloned();
+        if let Some(flight) = flight {
             flight.publish(info.clone());
         }
-        flight.done.notify_waiters();
     }
+    let res = res.map(|(info, _)| info);
     maybe_cache_not_found(params, &res);
     res
 }
@@ -555,11 +716,15 @@ fn join_index(dir: &str, index: &str) -> String {
     }
 }
 
+// Returns the loaded file plus a `share` flag: false when the body read was
+// skipped because the request's conditionals guarantee a 304 — such a result
+// is valid only for THIS request and must not be published to single-flight
+// followers or cached (both enforced by the callers/`will_cache`).
 async fn load_file(
     params: &StaticServeParams,
     mut file: String,
     accept_prefs: &Option<EncodingPrefs>,
-) -> Result<Arc<FileInfo>> {
+) -> Result<(Arc<FileInfo>, bool)> {
     let storage = get_storage()?;
     storage.validate(&file)?;
 
@@ -635,7 +800,7 @@ async fn load_file(
             read_file: file.clone(),
             last_modified_secs: None,
         };
-        return Ok(Arc::new(info));
+        return Ok((Arc::new(info), true));
     }
     if is_dir && !params.index.is_empty() {
         // The optimistic probe above already found the index absent — the
@@ -699,15 +864,20 @@ async fn load_file(
     if let Ok(v) = HeaderValue::try_from(cache_control) {
         headers.push((header::CACHE_CONTROL, v));
     }
+    let compressible = is_compressible_content_type(&content_type);
     if let Ok(v) = HeaderValue::try_from(content_type) {
         headers.push((header::CONTENT_TYPE, v));
     }
     // Try pre-compressed file (.br / .zst / .gz) if enabled and client supports
     // it. `negotiated_encoding` is the encoding actually served ("" = identity)
     // and becomes the cache-key suffix below. Priority: brotli > zstd > gzip.
+    // Gated on `precompressed`, not on Accept-Encoding presence — compress_cache
+    // also populates accept_prefs, and must not pay sibling `stat` probes for
+    // files that were never pre-compressed.
     let mut precompressed_file = None;
     let mut negotiated_encoding: &'static str = "";
-    if let Some(prefs) = accept_prefs
+    if params.precompressed
+        && let Some(prefs) = accept_prefs
         && !is_html
         && !is_dir
     {
@@ -748,8 +918,8 @@ async fn load_file(
     } else {
         last_modified_ms.map(|ms| format!(r#"W/"{size:x}-{ms:x}""#))
     };
-    if let Some(etag) = etag
-        && let Ok(v) = HeaderValue::try_from(etag)
+    if let Some(etag) = &etag
+        && let Ok(v) = HeaderValue::try_from(etag.as_str())
     {
         headers.push((header::ETAG, v));
     }
@@ -761,15 +931,41 @@ async fn load_file(
         }
     }
 
-    // size.to_string() is decimal digits — always a valid HeaderValue
+    // size.to_string() is decimal digits — always a valid HeaderValue.
+    // X-Original-Size is the stat (pre-compression) size; Content-Length is
+    // pushed after the body is known, because HTML replacement and cached
+    // compression can change the served byte count.
     if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
-        headers.push((X_ORIGINAL_SIZE_HEADER_NAME.clone(), v.clone()));
-        headers.push((header::CONTENT_LENGTH, v));
+        headers.push((X_ORIGINAL_SIZE_HEADER_NAME.clone(), v));
     }
+
+    // Will this load's result be stored in the in-memory cache? HTML caches
+    // only when STATIC_HTML_CACHE_TTL opted in; everything else follows
+    // cache_ttl. Shared by the conditional short-circuit below and the store at
+    // the end of the function.
+    let entry_ttl = if is_html {
+        params.html_cache_ttl
+    } else {
+        params.cache_ttl
+    };
+    let will_cache = params.cache_size > 0 && !params.head && !entry_ttl.is_zero();
+
+    // Conditional short-circuit: when the request's validators already
+    // guarantee a 304 (same predicate functions static_serve re-checks against
+    // the returned headers) and this entry would not be cached anyway, reading
+    // the body would be pure waste — the bytes are dropped on the 304 path.
+    // This matters for HTML, which is uncached by default: every revalidation
+    // would otherwise re-read the full body from the backend. When the entry
+    // WILL be cached the body is read regardless, since it amortizes across
+    // future requests. A body skipped this way must never be published to
+    // single-flight followers (share = false below): a non-conditional
+    // follower would stream it raw, bypassing buffering and the HTML replacer.
+    let not_modified =
+        !will_cache && conditional_not_modified(params, etag.as_deref(), last_modified_secs);
 
     // read html or small file
     let read_file = precompressed_file.as_deref().unwrap_or(&file);
-    let body = if !params.head && (is_html || size < params.read_max_size) {
+    let mut body = if !params.head && !not_modified && (is_html || size < params.read_max_size) {
         let buffer = storage
             .dal
             .read(read_file)
@@ -790,6 +986,51 @@ async fn load_file(
     } else {
         None
     };
+
+    // Cached dynamic compression (STATIC_COMPRESS_CACHE): compress a cacheable
+    // buffered body once — with the same encoder crate and level mapping the
+    // CompressionLayer applies per request — and let it be stored under the
+    // encoding-aware cache key below, so later requests serve the compressed
+    // bytes directly instead of re-compressing per response. Restricted to
+    // entries that will actually be cached (otherwise this just duplicates the
+    // layer's work) and representations that aren't already encoded (a
+    // pre-compressed sibling or a backend-set Content-Encoding wins). The
+    // resulting Content-Encoding header makes the CompressionLayer skip this
+    // response.
+    if params.compress_cache
+        && will_cache
+        && negotiated_encoding.is_empty()
+        && compressible
+        && !headers.iter().any(|(k, _)| *k == header::CONTENT_ENCODING)
+        && let Some(prefs) = accept_prefs
+        && let Some(b) = &body
+        && b.len() >= params.compress_min_length as usize
+    {
+        // Best accepted encoding only — each encoding is its own cache entry,
+        // so a client with different preferences populates its own variant.
+        for enc in ["br", "zstd", "gzip"] {
+            if prefs.accepts(enc) {
+                // Keep identity when compression doesn't actually shrink the
+                // body — an entry that is no smaller isn't worth the decode.
+                if let Some(compressed) = compress_body(enc, params.compress_level, b).await
+                    && compressed.len() < b.len()
+                {
+                    headers.push((header::CONTENT_ENCODING, HeaderValue::from_static(enc)));
+                    negotiated_encoding = enc;
+                    body = Some(compressed);
+                }
+                break;
+            }
+        }
+    }
+
+    // Content-Length reflects the bytes actually served: the (possibly
+    // replaced/compressed) buffered body, or the stat size for streamed files.
+    let content_length = body.as_ref().map(|b| b.len() as u64).unwrap_or(size);
+    if let Ok(v) = HeaderValue::from_str(&content_length.to_string()) {
+        headers.push((header::CONTENT_LENGTH, v));
+    }
+
     // Cache under the encoding-aware key (`negotiated_encoding` is "" for
     // identity, or the pre-compressed encoding). Because the key now encodes
     // exactly which bytes it holds, pre-compressed responses are safe to cache
@@ -806,25 +1047,78 @@ async fn load_file(
         read_file: read_path,
         last_modified_secs,
     });
-    if params.cache_size > 0 && !params.head {
+    if will_cache {
         // HTML is cached only when STATIC_HTML_CACHE_TTL opted in (clients
         // still see `no-cache`; this only amortizes backend reads over a short,
         // bounded window). Everything else keeps the regular TTL. Key by the
         // *request* path (`params.file`), not the possibly index-joined `file`
         // — lookups probe the request path, so a directory request must store
-        // under the key it will probe next time.
-        let ttl = if is_html {
-            params.html_cache_ttl
-        } else {
-            params.cache_ttl
-        };
-        if !ttl.is_zero() {
-            let key = encoding_cache_key(&params.file, negotiated_encoding);
-            set_file_to_cache(key, CacheValue::Found(info.clone()), params.cache_size, ttl);
-        }
+        // under the key it will probe next time. `will_cache` implies
+        // `!not_modified`, so a body-skipped conditional load is never stored.
+        let key = encoding_cache_key(&params.file, negotiated_encoding);
+        set_file_to_cache(
+            key,
+            CacheValue::Found(info.clone()),
+            params.cache_size,
+            entry_ttl,
+        );
     }
 
-    Ok(info)
+    Ok((info, !not_modified))
+}
+
+// Cached result of the custom `404.html` lookup: `Some(body)` when the page
+// exists, `None` when the backend definitively reported NotFound. Without this
+// every 404 pays a full backend read — or a failed-read round trip when the
+// file is absent — so on remote backends a path-scanning bot makes 404s more
+// expensive than real files. A single global slot: the path is fixed, so there
+// is nothing to key by.
+static NOT_FOUND_PAGE: Mutex<Option<(u64, Option<Bytes>)>> = Mutex::new(None);
+
+fn cached_not_found_page(now_secs: u64) -> Option<Option<Bytes>> {
+    let slot = NOT_FOUND_PAGE.lock().unwrap_or_else(|e| e.into_inner());
+    match &*slot {
+        Some((expires, result)) if *expires > now_secs => Some(result.clone()),
+        _ => None,
+    }
+}
+
+fn store_not_found_page(result: Option<Bytes>, ttl: Duration) {
+    *NOT_FOUND_PAGE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((now_unix_secs() + ttl.as_secs(), result));
+}
+
+// Fetch the custom 404 page (`404.html` in the storage root), caching both the
+// body and its absence for `cache_ttl` (zero = uncached, the historical
+// behavior). Only definitive outcomes are cached — a transient backend error
+// yields an uncached `None` so the page is not remembered as missing for a
+// whole TTL. The caller passes max(not_found_cache_ttl, html_cache_ttl): both
+// are the existing ≤5-minute bounded-staleness opt-ins, and opting into either
+// means accepting a short window of 404-page staleness.
+pub async fn not_found_page(cache_ttl: Duration) -> Option<Bytes> {
+    if !cache_ttl.is_zero()
+        && let Some(cached) = cached_not_found_page(now_unix_secs())
+    {
+        return cached;
+    }
+    let Ok(storage) = get_storage() else {
+        return None;
+    };
+    match storage.dal.read("404.html").await {
+        Ok(buf) => {
+            let body = Some(buf.to_bytes());
+            if !cache_ttl.is_zero() {
+                store_not_found_page(body.clone(), cache_ttl);
+            }
+            body
+        }
+        Err(e) => {
+            if e.kind() == opendal::ErrorKind::NotFound && !cache_ttl.is_zero() {
+                store_not_found_page(None, cache_ttl);
+            }
+            None
+        }
+    }
 }
 
 // A parsed `Range` header. `Ranges` holds one or more satisfiable byte ranges
@@ -847,6 +1141,15 @@ enum OneRange {
 // request into thousands of tiny reads / multipart parts; beyond this we ignore
 // the Range header entirely and serve the full 200.
 const MAX_RANGES: usize = 100;
+
+// Cap on the total bytes a multipart/byteranges response may cover. The
+// single-range path streams, but multipart is assembled in memory, and ranges
+// may overlap — so MAX_RANGES alone only bounds the part *count*: 100
+// full-file ranges over a 10 GB file would try to buffer ~1 TB. Multi-range
+// requests are in practice small seeks (media indexes, PDF chunks); past this
+// cap the Range header is ignored and the full representation is served as a
+// (streaming) 200. Single ranges are exempt — they never buffer.
+const MAX_MULTIPART_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 
 // Parse a single `start-end` spec against the representation size. `None` means
 // the spec is syntactically malformed — per RFC 7233 the caller then ignores the
@@ -924,6 +1227,16 @@ fn parse_ranges(range_header: &str, total_size: u64) -> Option<RangesValue> {
     if satisfiable.is_empty() {
         return Some(RangesValue::NotSatisfiable);
     }
+    // Multi-range only: bound the bytes the in-memory multipart assembly would
+    // buffer (ranges may overlap, so this can exceed the representation size).
+    if satisfiable.len() > 1 {
+        let total: u64 = satisfiable
+            .iter()
+            .fold(0u64, |acc, &(s, e)| acc.saturating_add(e - s + 1));
+        if total > MAX_MULTIPART_TOTAL_BYTES {
+            return None;
+        }
+    }
     Some(RangesValue::Ranges(satisfiable))
 }
 
@@ -942,8 +1255,8 @@ fn next_multipart_boundary(total_size: u64) -> String {
 // epilogue is the closing `--boundary--`. Buffered bodies are sliced directly;
 // streamed (large) files read each range from the backend. Unlike the single-
 // range path this buffers the requested bytes rather than streaming — multi-range
-// is used almost exclusively for small seeks (media, PDFs) and the range count is
-// capped by MAX_RANGES.
+// is used almost exclusively for small seeks (media, PDFs) and is bounded by
+// MAX_RANGES (part count) and MAX_MULTIPART_TOTAL_BYTES (total payload).
 async fn build_multipart_byteranges(
     file_info: &FileInfo,
     ranges: &[(u64, u64)],
@@ -1000,32 +1313,27 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         .map(|b| b.len() as u64)
         .unwrap_or(file_info.size);
 
-    // 304 Not Modified
+    // 304 Not Modified — the same predicate functions load_file consulted to
+    // decide whether the body read could be skipped.
     if let Some(if_none_match) = params.if_none_match.as_deref()
         && let Some((_, etag_value)) = file_info.headers.iter().find(|(k, _)| *k == header::ETAG)
+        && if_none_match_hit(if_none_match, etag_value.to_str().unwrap_or_default())
     {
-        let etag_str = etag_value.to_str().unwrap_or_default();
-        if if_none_match == "*" || if_none_match.split(',').any(|v| v.trim() == etag_str) {
-            let mut resp = StatusCode::NOT_MODIFIED.into_response();
-            resp.headers_mut().extend(
-                file_info
-                    .headers
-                    .iter()
-                    .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING)
-                    .cloned(),
-            );
-            return Ok(resp);
-        }
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        resp.headers_mut().extend(
+            file_info
+                .headers
+                .iter()
+                .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING)
+                .cloned(),
+        );
+        return Ok(resp);
     }
 
     // 304 Not Modified (If-Modified-Since)
     if let Some(ims) = params.if_modified_since.as_deref()
         && let Some(secs) = file_info.last_modified_secs
-        && let Ok(ims_time) = parse_http_date(ims)
-        && let Ok(ims_secs) = ims_time
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-        && secs <= ims_secs
+        && if_modified_since_hit(ims, secs)
     {
         let mut resp = StatusCode::NOT_MODIFIED.into_response();
         resp.headers_mut().extend(
@@ -1494,6 +1802,162 @@ mod tests {
             Duration::ZERO,
         );
         assert!(get_file_from_cache(&"expired\u{0}".to_string(), size, now_unix_secs()).is_none());
+    }
+
+    #[test]
+    fn parse_ranges_caps_total_multipart_bytes() {
+        let total = 100u64 * 1024 * 1024 * 1024; // 100 GiB representation
+        let five_mb = 5u64 * 1024 * 1024;
+        // two 5 MiB ranges sum past the 8 MiB cap -> ignore the header (full 200)
+        let header = format!("bytes=0-{},{}-{}", five_mb - 1, five_mb, 2 * five_mb - 1);
+        assert_eq!(parse_ranges(&header, total), None);
+        // a single range of any size is exempt — it streams as a plain 206
+        assert_eq!(
+            parse_ranges(&format!("bytes=0-{}", 2 * five_mb - 1), total),
+            Some(RangesValue::Ranges(vec![(0, 2 * five_mb - 1)]))
+        );
+        // multiple small ranges stay under the cap and are served
+        assert_eq!(
+            parse_ranges("bytes=0-9,20-29", total),
+            Some(RangesValue::Ranges(vec![(0, 9), (20, 29)]))
+        );
+        // overlapping ranges are summed as requested, not deduped: 3x a 3 MiB
+        // slice is 9 MiB of buffered payload and is rejected
+        let three_mb = 3u64 * 1024 * 1024;
+        let overlap = format!("bytes=0-{0},0-{0},0-{0}", three_mb - 1);
+        assert_eq!(parse_ranges(&overlap, total), None);
+    }
+
+    #[test]
+    fn flight_guard_removes_slot_and_wakes_followers_on_drop() {
+        let key = "guard-test.js\u{0}0000".to_string();
+        let flight = Arc::new(Flight::new());
+        inflight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), flight.clone());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            // register a follower first, exactly like get_file does
+            let notified = flight.done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // dropping the guard (leader cancelled) must remove the slot and
+            // wake the follower — otherwise this await would hang forever
+            drop(FlightGuard { key: key.clone() });
+            notified.await;
+        });
+        assert!(
+            !inflight()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&key)
+        );
+        // no result was published, so the follower falls back to its own load
+        assert!(flight.result().is_none());
+    }
+
+    #[test]
+    fn compressible_content_types() {
+        assert!(is_compressible_content_type("text/html; charset=utf-8"));
+        assert!(is_compressible_content_type("application/javascript"));
+        assert!(is_compressible_content_type("application/wasm"));
+        assert!(is_compressible_content_type("image/svg+xml"));
+        // already-compressed formats stay excluded
+        assert!(!is_compressible_content_type("image/png"));
+        assert!(!is_compressible_content_type("video/mp4"));
+        assert!(!is_compressible_content_type("application/octet-stream"));
+    }
+
+    #[test]
+    fn compress_body_shrinks_repetitive_input() {
+        // highly repetitive input must compress under every supported encoding;
+        // an unknown encoding yields None (callers keep the identity body)
+        let input = vec![b'a'; 64 * 1024];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            for enc in ["br", "zstd", "gzip"] {
+                let out = compress_body(enc, CompressionLevel::Default, &input)
+                    .await
+                    .expect("supported encoding compresses");
+                assert!(
+                    out.len() < input.len(),
+                    "{enc} output should shrink: {} vs {}",
+                    out.len(),
+                    input.len()
+                );
+            }
+            assert!(
+                compress_body("deflate", CompressionLevel::Default, &input)
+                    .await
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn conditional_predicates() {
+        // If-None-Match: wildcard, exact, comma list with spaces, mismatch
+        assert!(if_none_match_hit("*", "\"abc\""));
+        assert!(if_none_match_hit("\"abc\"", "\"abc\""));
+        assert!(if_none_match_hit("\"x\", \"abc\"", "\"abc\""));
+        assert!(!if_none_match_hit("\"x\"", "\"abc\""));
+
+        // If-Modified-Since: not newer -> hit, newer -> miss, garbage -> miss
+        let at_2000 = fmt_http_date(UNIX_EPOCH + Duration::from_secs(2000));
+        assert!(if_modified_since_hit(&at_2000, 1000));
+        assert!(if_modified_since_hit(&at_2000, 2000));
+        assert!(!if_modified_since_hit(&at_2000, 3000));
+        assert!(!if_modified_since_hit("not a date", 1000));
+    }
+
+    #[test]
+    fn conditional_not_modified_combines_both_validators() {
+        let mut params = StaticServeParams {
+            if_none_match: Some(Arc::from("\"abc\"")),
+            ..Default::default()
+        };
+        // ETag arm hits independently of Last-Modified
+        assert!(conditional_not_modified(&params, Some("\"abc\""), None));
+        assert!(!conditional_not_modified(&params, Some("\"other\""), None));
+        // no stored ETag -> the INM arm can't hit
+        assert!(!conditional_not_modified(&params, None, Some(1000)));
+
+        // IMS arm hits when INM missed (mirrors static_serve's two checks)
+        params.if_modified_since = Some(Arc::from(
+            fmt_http_date(UNIX_EPOCH + Duration::from_secs(2000)).as_str(),
+        ));
+        assert!(conditional_not_modified(
+            &params,
+            Some("\"other\""),
+            Some(1000)
+        ));
+
+        // no conditional headers at all -> never a hit
+        let bare = StaticServeParams::default();
+        assert!(!conditional_not_modified(&bare, Some("\"abc\""), Some(0)));
+    }
+
+    #[test]
+    fn not_found_page_cache_roundtrip() {
+        let now = now_unix_secs();
+        // nothing stored yet -> miss (no other test touches this slot)
+        assert!(cached_not_found_page(now).is_none());
+        // a stored body comes back until the TTL passes
+        let body = Bytes::from_static(b"<h1>404</h1>");
+        store_not_found_page(Some(body.clone()), Duration::from_secs(60));
+        assert_eq!(cached_not_found_page(now), Some(Some(body)));
+        // the page's absence is a cacheable result too
+        store_not_found_page(None, Duration::from_secs(60));
+        assert_eq!(cached_not_found_page(now), Some(None));
+        // a zero TTL is already expired on the next lookup
+        store_not_found_page(None, Duration::ZERO);
+        assert!(cached_not_found_page(now_unix_secs()).is_none());
     }
 
     #[test]
