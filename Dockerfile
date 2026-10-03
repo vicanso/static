@@ -1,4 +1,4 @@
-FROM rust:1.95.0 as builder
+FROM rust:1.98.1-trixie as builder
 
 COPY . /static
 
