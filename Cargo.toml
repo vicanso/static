@@ -19,8 +19,8 @@ ftp = ["opendal/services-ftp"]
 gridfs = ["opendal/services-gridfs"]
 
 [dependencies]
-TinyUFO = "0.8.1"
-aho-corasick = "1.1.4"
+TinyUFO = "0.9.0"
+aho-corasick = "1.1.5"
 # Already in the tree via tower-http's compression features — used directly by
 # serve.rs to produce cached compressed bodies with the exact same encoders and
 # level mapping the CompressionLayer applies per request.
@@ -31,31 +31,33 @@ async-compression = { version = "0.4", features = [
     "zstd",
 ] }
 axum = "0.8.9"
-bytes = "1.12.0"
-bytesize = "2.4.2"
+bytes = "1.12.1"
+bytesize = "2.7.0"
 envy = "0.4.2"
-base64 = "0.22"
-http-body = "1.0.1"
+# Already in the tree via axum/hyper; used directly for `StreamExt::next` over
+# opendal's `Lister` stream (autoindex).
+futures-util = { version = "0.3.34", default-features = false }
+base64 = "0.23.1"
+http-body = "1.1.0"
 httpdate = "1.0"
-ipnet = "2.12.0"
-humantime = "2.3.0"
+ipnet = "2.12.2"
+humantime = "2.4.0"
 mime_guess = "2.0.5"
 mimalloc = "0.1.52"
 num_cpus = "1.17.0"
-opendal = { version = "0.57.0", features = [
+opendal = { version = "0.59.3", features = [
     "services-fs",
     "layers-mime-guess",
     "layers-retry",
     "layers-timeout",
 ] }
-path-absolutize = "3.1.1"
-serde = { version = "1.0.228", features = ["derive"] }
-snafu = "0.9.1"
-time = "0.3.53"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal"] }
-tokio-util = { version = "0.7.18", features = ["compat"] }
+path-absolutize = "4.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+snafu = "0.9.2"
+time = "0.3.55"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "signal"] }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.7.0", features = [
+tower-http = { version = "0.7.1", features = [
     "compression-br",
     "compression-gzip",
     "compression-zstd",

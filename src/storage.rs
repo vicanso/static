@@ -114,39 +114,102 @@ fn apply_resilience(mut dal: Operator) -> Operator {
     dal
 }
 
+// Streaming-read tuning (STATIC_BACKEND_READ_CONCURRENT / _CHUNK), injected
+// once at startup like the resilience layers. `concurrent <= 1` keeps opendal's
+// default sequential reader; above that, a streamed body is fetched as
+// `concurrent` in-flight ranged reads of `chunk` bytes each — a large
+// throughput win on high-latency remote backends (S3) for big files, at the
+// cost of up to `concurrent * chunk` buffered bytes per streaming response.
+struct ReadTuning {
+    concurrent: usize,
+    chunk: usize,
+}
+
+static READ_TUNING: OnceLock<ReadTuning> = OnceLock::new();
+
+pub fn init_read_tuning(concurrent: usize, chunk: usize) {
+    let _ = READ_TUNING.set(ReadTuning { concurrent, chunk });
+    if concurrent > 1 {
+        info!(
+            concurrent,
+            chunk, "concurrent backend streaming reads enabled"
+        );
+    }
+}
+
+// Whether a request path contains a `..` segment. Backslash counts as a
+// separator too: some FTP servers (Windows-hosted) treat it as one.
+fn has_dot_dot_segment(file: &str) -> bool {
+    file.split(['/', '\\']).any(|segment| segment == "..")
+}
+
 pub struct Storage {
     pub dal: Operator,
     root: Option<PathBuf>,
 }
 
 impl Storage {
-    pub fn validate(&self, file: &str) -> Result<()> {
-        if let Some(root_path) = &self.root {
-            let full_path = root_path.join(file);
-
-            let validated_path = full_path.absolutize().map_err(|e| Error::InvalidFile {
-                message: e.to_string(),
-            })?;
-            if !validated_path.starts_with(root_path) {
+    pub async fn validate(&self, file: &str) -> Result<()> {
+        let Some(root_path) = &self.root else {
+            // Remote backends: opendal's path normalization collapses slashes
+            // but never resolves `..`, and an FTP server resolves it itself —
+            // so `a/../../x` could climb out of the configured root. Browsers
+            // normalize dot-segments before sending, so only crafted requests
+            // carry one; reject them outright.
+            if has_dot_dot_segment(file) {
                 return Err(Error::InvalidFile {
                     message: format!("Path traversal attempt blocked, file: {file}"),
                 });
             }
-            // `absolutize` is purely lexical. Harden against symlinks that
-            // escape the (already-canonical) root: if the target exists, its
-            // canonical path must also stay under the root. This is the only FS
-            // syscall here; STATIC_DISABLE_SYMLINK_CHECK=true skips it for asset
-            // trees known to be symlink-free (the lexical check above stays on).
-            if !skip_symlink_check()
-                && let Ok(canonical) = full_path.canonicalize()
-                && !canonical.starts_with(root_path)
-            {
-                return Err(Error::InvalidFile {
-                    message: format!("Path escapes root via symlink, file: {file}"),
-                });
-            }
+            return Ok(());
+        };
+        let full_path = root_path.join(file);
+
+        let validated_path = full_path.absolutize().map_err(|e| Error::InvalidFile {
+            message: e.to_string(),
+        })?;
+        if !validated_path.starts_with(root_path) {
+            return Err(Error::InvalidFile {
+                message: format!("Path traversal attempt blocked, file: {file}"),
+            });
+        }
+        // `absolutize` is purely lexical. Harden against symlinks that escape
+        // the (already-canonical) root: if the target exists, its canonical
+        // path must also stay under the root. `canonicalize` is a blocking
+        // realpath(3) (one lstat/readlink per path component), so it runs on
+        // the blocking pool rather than stalling an async worker — on a slow or
+        // network-mounted root that call can take milliseconds.
+        // STATIC_DISABLE_SYMLINK_CHECK=true skips it for asset trees known to be
+        // symlink-free (the lexical check above stays on).
+        if skip_symlink_check() {
+            return Ok(());
+        }
+        let canonical = tokio::task::spawn_blocking(move || full_path.canonicalize())
+            .await
+            .map_err(|_| Error::Unknown)?;
+        if let Ok(canonical) = canonical
+            && !canonical.starts_with(root_path)
+        {
+            return Err(Error::InvalidFile {
+                message: format!("Path escapes root via symlink, file: {file}"),
+            });
         }
         Ok(())
+    }
+
+    // Open a streaming reader for `path`, applying the configured concurrent
+    // chunked-read tuning when enabled.
+    pub async fn reader(&self, path: &str) -> opendal::Result<opendal::Reader> {
+        match READ_TUNING.get() {
+            Some(t) if t.concurrent > 1 => {
+                self.dal
+                    .reader_with(path)
+                    .concurrent(t.concurrent)
+                    .chunk(t.chunk)
+                    .await
+            }
+            _ => self.dal.reader(path).await,
+        }
     }
 }
 
@@ -188,8 +251,7 @@ fn parse_params(url: &str) -> Result<StorageParams> {
 fn build_operator<B: Builder>(builder: B) -> Result<Operator> {
     let dal = Operator::new(builder)
         .map_err(|e| Error::Openedal { source: e })?
-        .layer(MimeGuessLayer::default())
-        .finish();
+        .layer(MimeGuessLayer::default());
     Ok(apply_resilience(dal))
 }
 
@@ -305,8 +367,7 @@ pub fn get_storage() -> Result<&'static Storage> {
                 info!(category = "fs", path = %abs_path.to_string_lossy(), "initialize storage");
                 let dal = opendal::Operator::new(opendal)
                     .map_err(|e| Error::Openedal { source: e })?
-                    .layer(MimeGuessLayer::default())
-                    .finish();
+                    .layer(MimeGuessLayer::default());
                 Ok(Storage {
                     dal: apply_resilience(dal),
                     root: Some(abs_path),
@@ -315,4 +376,22 @@ pub fn get_storage() -> Result<&'static Storage> {
         }
     }?;
     Ok(STORAGE.get_or_init(|| storage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_dot_segments_are_detected() {
+        assert!(has_dot_dot_segment(".."));
+        assert!(has_dot_dot_segment("a/../../etc/passwd"));
+        assert!(has_dot_dot_segment("a\\..\\b"));
+        assert!(has_dot_dot_segment("a/.."));
+        // dots inside a name are not a traversal
+        assert!(!has_dot_dot_segment("a/..b/c"));
+        assert!(!has_dot_dot_segment("a/b../c"));
+        assert!(!has_dot_dot_segment("./a/.hidden"));
+        assert!(!has_dot_dot_segment(""));
+    }
 }

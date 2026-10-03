@@ -56,11 +56,12 @@ Every option is set via an environment variable and parsed once at startup.
 |---|---|---|
 | `STATIC_CACHE_CONTROL` | `public, max-age=31536000, immutable` | `Cache-Control` for static assets. HTML is always `no-cache`. |
 | `STATIC_CACHE_CONTROL_EXT_*` | — | Per-extension override, e.g. `STATIC_CACHE_CONTROL_EXT_WASM=no-cache`. See [Per-Extension Cache Control](#per-extension-cache-control). |
-| `STATIC_CACHE_SIZE` | `1024` | LRU cache entry count |
-| `STATIC_CACHE_TTL` | `10m` | Cache TTL. HTML files are not cached unless `STATIC_HTML_CACHE_TTL` is set. |
+| `STATIC_CACHE_SIZE` | `1024` | LRU cache entry count (`0` disables the cache). With `STATIC_CACHE_MAX_BYTES` set it only sizes the cache's internal tables. |
+| `STATIC_CACHE_MAX_BYTES` | — (off) | Bound the cache by total cached body bytes instead of entry count (e.g. `256MB`), so many large entries can't exceed a memory budget. Bodies are weighed in KiB; metadata-only entries weigh 1 KiB. |
+| `STATIC_CACHE_TTL` | `10m` | Cache TTL. HTML files are not cached unless `STATIC_HTML_CACHE_TTL` is set. Streamed files (≥ `STATIC_READ_MAX_SIZE`) cache only metadata, revalidated with one backend `stat` per hit, so a file overwritten in place is never served with stale `Content-Length` / `ETag`. |
 | `STATIC_NOT_FOUND_CACHE_TTL` | `0` (off) | Negative-cache 404 lookups for this long (max `5m`), so hot missing paths (e.g. a probed `favicon.ico`) skip the backend `stat`. A file created within the window keeps 404ing until it expires. |
-| `STATIC_HTML_CACHE_TTL` | `0` (off) | Cache HTML bodies in memory for this long (max `5m`). Clients still receive `Cache-Control: no-cache`; this only amortizes backend reads — useful for remote backends (S3/FTP/GridFS). Updated HTML may be served stale for up to this window. |
-| `STATIC_NOT_MODIFIED` | `false` | Enable `304 Not Modified` via `If-None-Match` / `ETag` |
+| `STATIC_HTML_CACHE_TTL` | `0` (off) | Cache HTML bodies in memory for this long (max `5m`). Clients still receive `Cache-Control: no-cache`; this only amortizes backend reads — useful for remote backends (S3/FTP/GridFS). Updated HTML may be served stale for up to this window. HTML files at or above `STATIC_READ_MAX_SIZE` are never cached. |
+| `STATIC_NOT_MODIFIED` | `false` | Enable `304 Not Modified` via `If-None-Match` / `ETag` (weak comparison) and `If-Modified-Since`. When both are sent, `If-None-Match` alone decides (RFC 9110) — an ETag mismatch is never overridden by an unchanged modification date. |
 
 ### Compression
 
@@ -69,7 +70,7 @@ Every option is set via an environment variable and parsed once at startup.
 | `STATIC_COMPRESS_MIN_LENGTH` | `256` | Minimum response size in bytes to compress (`0` disables the runtime compression layer entirely) |
 | `STATIC_COMPRESS_LEVEL` | `default` | Runtime compression quality: `fastest`, `best`, `default`, or an integer for a precise per-algorithm level. Use `fastest` to cut CPU on high-traffic text/JS/JSON responses; prefer `STATIC_PRECOMPRESSED` to avoid runtime compression altogether. |
 | `STATIC_PRECOMPRESSED` | `false` | Serve `.br` / `.zst` / `.gz` siblings (e.g. `app.js.br` for `app.js`) when the client supports the encoding, skipping runtime compression. Negotiation is `q`-value aware (a `br;q=0` is honored as a refusal). Negotiated responses are cached per-encoding, so a repeat hit serves straight from memory. |
-| `STATIC_COMPRESS_CACHE` | `false` | Compress cacheable buffered responses once (same encoders and level as the runtime layer) and store the compressed bytes in the in-memory cache per encoding — repeat hits skip re-compression entirely. No build-step `.br`/`.gz` files needed; a pre-compressed sibling or backend `Content-Encoding` still wins. Requires the cache and compression to be enabled. |
+| `STATIC_COMPRESS_CACHE` | `false` | Compress cacheable buffered responses once (same encoders and level as the runtime layer — brotli's `default` is quality 4) and store the compressed bytes in the in-memory cache per encoding — repeat hits skip re-compression entirely. Compression runs on the blocking thread pool, never on a request worker. No build-step `.br`/`.gz` files needed; a pre-compressed sibling or backend `Content-Encoding` still wins. Requires the cache and compression to be enabled. |
 
 ### Routing & Fallback
 
@@ -124,6 +125,8 @@ Every option is set via an environment variable and parsed once at startup.
 | Variable | Default | Description |
 |---|---|---|
 | `STATIC_READ_MAX_SIZE` | `250KB` | Max file size buffered in memory; larger files are streamed. Accepts human-readable sizes (`30KB`, `1MB`). |
+| `STATIC_BACKEND_READ_CONCURRENT` | `1` (off) | Fetch streamed files as this many concurrent ranged reads. A large throughput win for big files on high-latency backends (S3); costs up to `concurrent × chunk` buffered bytes per streaming response. |
+| `STATIC_BACKEND_READ_CHUNK` | `8MB` | Chunk size of each concurrent read (used only when `STATIC_BACKEND_READ_CONCURRENT` > 1). |
 | `STATIC_DISABLE_SYMLINK_CHECK` | `false` | Local FS only. Skip the per-request `canonicalize()` syscall that blocks symlinks escaping the root. Lexical `../` traversal protection stays on regardless. Enable only when the asset tree is known to be symlink-free, to save the syscall on cache misses. |
 | `STATIC_ACCESS_LOG` | `true` | Enable access logging |
 | `LOG_LEVEL` | `INFO` | Log level: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` |
@@ -193,6 +196,8 @@ With the list set:
 
 This applies everywhere the client IP is used: IP allow/block lists, rate limiting and its exemptions, and access logs. Unlike the other IP lists, an invalid entry here exits at startup — a silently dropped proxy CIDR would distrust the real proxy and apply access control to the load balancer's address instead.
 
+If an IP allowlist / blocklist or rate limiting is enabled while `STATIC_TRUST_PROXY` is unset, a warning is logged at startup, since those features can then be bypassed with a forged header.
+
 ## Rate Limiting
 
 Protect against bursts and DoS with a per-IP [token bucket](https://en.wikipedia.org/wiki/Token_bucket). It is **disabled by default**; set `STATIC_RATE_LIMIT` to the sustained number of requests per second allowed per client IP. `STATIC_RATE_LIMIT_BURST` is the bucket capacity — how many requests can arrive at once before the sustained rate applies — and defaults to `STATIC_RATE_LIMIT` when unset.
@@ -209,6 +214,8 @@ STATIC_RATE_LIMIT_EXEMPT=10.0.0.0/8,192.168.0.0/16,127.0.0.1
 The client IP is resolved the same way as IP access control (`X-Forwarded-For`, then `X-Real-IP`, then the connection address), so place the server behind a trusted proxy that sets these headers if you are not terminating connections directly. Requests that exceed the limit receive `429 Too Many Requests` with a `Retry-After` header (seconds). Limiting is applied after IP access control, and the `/health` and `/metrics` routes bypass it entirely.
 
 Clients whose IP matches `STATIC_RATE_LIMIT_EXEMPT` (individual IPs or CIDR ranges, IPv4 or IPv6) skip the limiter — useful for internal networks, health checkers, or trusted upstreams that should never be throttled.
+
+Buckets are kept in 64 independently locked shards, so concurrent clients don't contend on one lock, and idle buckets are swept per shard. Memory is hard-capped at roughly one million tracked IPs; once a shard is full, previously unseen IPs are let through untracked (fail-open) rather than evicting active buckets or rejecting new clients.
 
 ## Redirect Rules
 
@@ -259,10 +266,12 @@ Priority, highest to lowest:
 
 Two independent mechanisms:
 
-- **`404.html` in `STATIC_PATH`** — place a `404.html` file at the root of your `STATIC_PATH`. When a file is not found it is served verbatim with a `404` status. No configuration needed, and it takes precedence for 404s. The lookup (the page body, or the fact that none exists) is cached in memory when `STATIC_NOT_FOUND_CACHE_TTL` or `STATIC_HTML_CACHE_TTL` is set (using the larger of the two), so bursts of 404s don't re-read the backend.
-- **`STATIC_ERROR_PAGE`** — a filesystem path to a custom template used for *all* error statuses (404, 403, 408, 400, 500, …). The template may contain `{{STATUS}}` and `{{REASON}}` placeholders, substituted with the status code and its reason phrase. It is resolved once at startup: if the path is set but the file cannot be read, the server logs an error and exits (it never serves with a misconfigured page). If unset, a built-in page is used.
+- **`404.html` in `STATIC_PATH`** — place a `404.html` file at the root of your `STATIC_PATH`. When a file is not found it is served verbatim with a `404` status. No configuration needed, and it takes precedence for 404s. The lookup (the page body, or the fact that none exists) is cached in memory — for the larger of `STATIC_NOT_FOUND_CACHE_TTL` / `STATIC_HTML_CACHE_TTL` when either is set, otherwise for 10 seconds — so bursts of 404s don't re-read the backend. Edits to `404.html` take effect within that window.
+- **`STATIC_ERROR_PAGE`** — a filesystem path to a custom template used for *all* error statuses (400, 403, 404, 500, 503, 504, …). The template may contain `{{STATUS}}` and `{{REASON}}` placeholders, substituted with the status code and its reason phrase. It is resolved once at startup: if the path is set but the file cannot be read, the server logs an error and exits (it never serves with a misconfigured page). If unset, a built-in page is used.
 
 Internal error detail (e.g. raw storage errors) is never shown to clients — it is logged server-side only.
+
+Status codes: a missing path is `404` (including a path that runs through a regular file, e.g. `/app.js/x`); a storage permission error is `403`; a transient backend failure (rate limiting, timeouts, connection errors) is `503`; any other storage error is `500`; a request exceeding `STATIC_TIMEOUT` is `504`; a rejected path (traversal attempt) is `400`.
 
 ## Health Check
 
@@ -293,11 +302,11 @@ STATIC_CORS_ALLOW_CREDENTIALS=true
 
 ## Metrics
 
-When `STATIC_METRICS` is `true` (the default), `GET /metrics` returns Prometheus-format metrics: total requests, responses by status class, total response bytes, in-memory cache hits / misses, a `static_serve_request_duration_seconds` latency **histogram** (time to produce the response), and `static_serve_cache_entries` / `static_serve_cache_capacity` **gauges** for current cache occupancy and configured capacity (their ratio is the fill level). Like `/health`, it bypasses Basic Auth and IP access control — restrict it at the proxy if exposure is a concern, or set `STATIC_METRICS=false` to remove the route entirely. Collection overhead is negligible for normal workloads (a few atomic counters and two clock reads per request); `STATIC_METRICS=false` skips that recording as well, so disabling metrics is genuinely free on the hot path.
+When `STATIC_METRICS` is `true` (the default), `GET /metrics` returns Prometheus-format metrics: total requests, responses by status class, total response bytes, in-memory cache hits / misses, a `static_serve_request_duration_seconds` latency **histogram** (time to produce the response), and `static_serve_cache_entries` / `static_serve_cache_capacity` **gauges** for current cache occupancy and configured capacity (their ratio is the fill level; with `STATIC_CACHE_MAX_BYTES` set, capacity is still the `STATIC_CACHE_SIZE` entry estimate). The response byte counter counts body bytes actually served (logical, before compression): `304` and `HEAD` responses count `0`, range responses count only the requested bytes. Like `/health`, it bypasses Basic Auth and IP access control — restrict it at the proxy if exposure is a concern, or set `STATIC_METRICS=false` to remove the route entirely. Collection overhead is negligible for normal workloads (a few atomic counters and two clock reads per request); `STATIC_METRICS=false` skips that recording as well, so disabling metrics is genuinely free on the hot path.
 
 ## Storage Backends
 
-All backends are powered by [Apache OpenDAL](https://github.com/apache/opendal) and auto-detected from the `STATIC_PATH` format — no extra configuration flags.
+All backends are powered by [Apache OpenDAL](https://github.com/apache/opendal) and auto-detected from the `STATIC_PATH` format — no extra configuration flags. On every backend, a request path containing a `..` segment is rejected with `400` (the local filesystem additionally verifies the resolved path, including symlinks, stays under the root).
 
 ### Local Filesystem
 

@@ -56,11 +56,12 @@ docker run -d --restart=always \
 |---|---|---|
 | `STATIC_CACHE_CONTROL` | `public, max-age=31536000, immutable` | 静态资源的 `Cache-Control`。HTML 始终为 `no-cache`。 |
 | `STATIC_CACHE_CONTROL_EXT_*` | — | 按扩展名覆盖，如 `STATIC_CACHE_CONTROL_EXT_WASM=no-cache`。见[按扩展名细化缓存策略](#按扩展名细化缓存策略)。 |
-| `STATIC_CACHE_SIZE` | `1024` | LRU 缓存条目数 |
-| `STATIC_CACHE_TTL` | `10m` | 缓存有效期。HTML 文件默认不缓存，除非设置 `STATIC_HTML_CACHE_TTL`。 |
+| `STATIC_CACHE_SIZE` | `1024` | LRU 缓存条目数（`0` 关闭缓存）。设置了 `STATIC_CACHE_MAX_BYTES` 时仅用于确定缓存内部表的大小。 |
+| `STATIC_CACHE_MAX_BYTES` | —（关闭） | 按缓存内容的总字节数（而非条目数）限制缓存，例如 `256MB`，避免大量大条目突破内存预算。内容按 KiB 计权重；仅含元数据的条目计 1 KiB。 |
+| `STATIC_CACHE_TTL` | `10m` | 缓存有效期。HTML 文件默认不缓存，除非设置 `STATIC_HTML_CACHE_TTL`。流式传输的文件（≥ `STATIC_READ_MAX_SIZE`）只缓存元数据，每次命中都会做一次后端 `stat` 校验，因此原地覆盖的文件不会以过期的 `Content-Length` / `ETag` 返回。 |
 | `STATIC_NOT_FOUND_CACHE_TTL` | `0`（关闭） | 404 负缓存时长（上限 `5m`）：热点的不存在路径（如被探测的 `favicon.ico`）在窗口内直接返回 404，不再访问后端 `stat`。窗口内新建的同名文件会持续 404 直到过期。 |
-| `STATIC_HTML_CACHE_TTL` | `0`（关闭） | HTML 内存缓存时长（上限 `5m`）。客户端仍收到 `Cache-Control: no-cache`，仅摊薄服务端到后端的读取 —— 对远程后端（S3/FTP/GridFS）收益明显。更新后的 HTML 最多可能延迟此窗口才生效。 |
-| `STATIC_NOT_MODIFIED` | `false` | 启用基于 `If-None-Match` / `ETag` 的 `304 Not Modified` |
+| `STATIC_HTML_CACHE_TTL` | `0`（关闭） | HTML 内存缓存时长（上限 `5m`）。客户端仍收到 `Cache-Control: no-cache`，仅摊薄服务端到后端的读取 —— 对远程后端（S3/FTP/GridFS）收益明显。更新后的 HTML 最多可能延迟此窗口才生效。大小达到或超过 `STATIC_READ_MAX_SIZE` 的 HTML 文件永不缓存。 |
+| `STATIC_NOT_MODIFIED` | `false` | 启用基于 `If-None-Match` / `ETag`（弱比较）与 `If-Modified-Since` 的 `304 Not Modified`。两者同时出现时只看 `If-None-Match`（RFC 9110）——ETag 不匹配时不会因为修改时间未变而返回 304。 |
 
 ### 压缩
 
@@ -69,7 +70,7 @@ docker run -d --restart=always \
 | `STATIC_COMPRESS_MIN_LENGTH` | `256` | 启用压缩的最小响应字节数（设为 `0` 则完全关闭运行时压缩层） |
 | `STATIC_COMPRESS_LEVEL` | `default` | 运行时压缩质量：`fastest`、`best`、`default`，或用整数指定算法的精确级别。高流量的文本/JS/JSON 响应可用 `fastest` 降低 CPU；若想彻底免去运行时压缩，优先使用 `STATIC_PRECOMPRESSED`。 |
 | `STATIC_PRECOMPRESSED` | `false` | 当客户端支持对应编码时，直接返回 `.br` / `.zst` / `.gz` 副本（如 `app.js` 对应 `app.js.br`），跳过运行时压缩。协商遵循 `q` 值（`br;q=0` 视为明确拒绝）。协商出的响应会按编码分别缓存，重复命中直接走内存。 |
-| `STATIC_COMPRESS_CACHE` | `false` | 对可缓存的缓冲响应只压缩一次（与运行时压缩层同样的编码器和级别），并按编码把压缩后的字节存入内存缓存——重复命中完全跳过再压缩。无需构建期生成 `.br`/`.gz` 文件；预压缩副本或后端自带的 `Content-Encoding` 仍然优先。需要缓存与压缩均已启用。 |
+| `STATIC_COMPRESS_CACHE` | `false` | 对可缓存的缓冲响应只压缩一次（与运行时压缩层同样的编码器和级别——brotli 的 `default` 为质量 4），并按编码把压缩后的字节存入内存缓存——重复命中完全跳过再压缩。压缩在阻塞线程池中执行，不占用处理请求的工作线程。无需构建期生成 `.br`/`.gz` 文件；预压缩副本或后端自带的 `Content-Encoding` 仍然优先。需要缓存与压缩均已启用。 |
 
 ### 路由与回退
 
@@ -124,6 +125,8 @@ docker run -d --restart=always \
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `STATIC_READ_MAX_SIZE` | `250KB` | 直接读入内存的最大文件大小，超过则流式传输。支持可读格式（`30KB`、`1MB`）。 |
+| `STATIC_BACKEND_READ_CONCURRENT` | `1`（关闭） | 以该数量的并发分段读取来获取流式文件。对高延迟后端（S3）上的大文件吞吐提升明显；每个流式响应最多缓冲 `concurrent × chunk` 字节。 |
+| `STATIC_BACKEND_READ_CHUNK` | `8MB` | 每个并发分段读取的大小（仅在 `STATIC_BACKEND_READ_CONCURRENT` > 1 时生效）。 |
 | `STATIC_DISABLE_SYMLINK_CHECK` | `false` | 仅本地文件系统。跳过每次请求中用于拦截符号链接逃逸根目录的 `canonicalize()` 系统调用；词法层面的 `../` 穿越防护始终生效。仅在确认资源目录不含符号链接时启用，以在缓存未命中时省去该系统调用。 |
 | `STATIC_ACCESS_LOG` | `true` | 启用访问日志 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` |
@@ -193,6 +196,8 @@ STATIC_TRUST_PROXY=10.0.0.0/8,127.0.0.1
 
 该解析结果用于所有依赖客户端 IP 的功能：IP 黑白名单、限流及其豁免、访问日志。与其他 IP 列表不同，此列表存在非法项时启动即退出——静默丢弃写错的代理 CIDR 会导致真实代理不被信任，访问控制反而作用到负载均衡器的地址上。
 
+若启用了 IP 黑白名单或限流但未设置 `STATIC_TRUST_PROXY`，启动时会记录一条警告，因为此时这些功能可被伪造的请求头绕过。
+
 ## 限流
 
 通过基于 IP 的[令牌桶](https://zh.wikipedia.org/wiki/%E4%BB%A4%E7%89%8C%E6%A1%B6)防御突发流量与 DoS。该功能**默认关闭**；将 `STATIC_RATE_LIMIT` 设置为每个客户端 IP 允许的持续请求速率（请求/秒）。`STATIC_RATE_LIMIT_BURST` 为令牌桶容量——即在回落到持续速率前可一次性涌入的请求数——未设置时默认等于 `STATIC_RATE_LIMIT`。
@@ -209,6 +214,8 @@ STATIC_RATE_LIMIT_EXEMPT=10.0.0.0/8,192.168.0.0/16,127.0.0.1
 客户端 IP 的解析方式与 IP 访问控制一致（依次为 `X-Forwarded-For`、`X-Real-IP`、连接地址），因此若非直接终结连接，请将服务部署在会设置这些头的可信代理之后。超过限制的请求收到带 `Retry-After` 头（秒）的 `429 Too Many Requests`。限流在 IP 访问控制之后执行，且 `/health` 与 `/metrics` 路由完全绕过限流。
 
 IP 匹配 `STATIC_RATE_LIMIT_EXEMPT`（单个 IP 或 CIDR 网段，支持 IPv4/IPv6）的客户端将跳过限流——适用于内部网络、健康检查器或不应被限流的可信上游。
+
+令牌桶分布在 64 个独立加锁的分片中，并发客户端不会争抢同一把锁，空闲桶也按分片清理。内存有硬上限（约一百万个被跟踪的 IP）；分片已满时，新出现的 IP 直接放行且不被跟踪（fail-open），而不是驱逐活跃的桶或拒绝新客户端。
 
 ## 重定向规则
 
@@ -259,10 +266,12 @@ STATIC_CACHE_CONTROL_EXT_JSON=public, max-age=300
 
 两套相互独立的机制：
 
-- **`STATIC_PATH` 下的 `404.html`** —— 在 `STATIC_PATH` 根目录放置 `404.html`，文件不存在时原样返回该页面并设 `404` 状态码，无需任何配置；对 404 优先生效。设置了 `STATIC_NOT_FOUND_CACHE_TTL` 或 `STATIC_HTML_CACHE_TTL`（取两者较大值）时，该查询结果（页面内容或"不存在"这一事实）会缓存在内存中，突发的 404 不会反复读后端。
-- **`STATIC_ERROR_PAGE`** —— 指向一个自定义模板的文件系统路径，适用于*所有*错误状态（404/403/408/400/500…）。模板可包含 `{{STATUS}}` 和 `{{REASON}}` 占位符，分别替换为状态码与原因短语。启动时解析一次：若设置了路径但文件读取失败，服务器记录错误并退出（绝不带错误配置的页面运行）；未设置时使用内置页面。
+- **`STATIC_PATH` 下的 `404.html`** —— 在 `STATIC_PATH` 根目录放置 `404.html`，文件不存在时原样返回该页面并设 `404` 状态码，无需任何配置；对 404 优先生效。该查询结果（页面内容或"不存在"这一事实）会缓存在内存中——设置了 `STATIC_NOT_FOUND_CACHE_TTL` / `STATIC_HTML_CACHE_TTL` 时取两者较大值，否则缓存 10 秒——突发的 404 不会反复读后端。对 `404.html` 的修改在该窗口内生效。
+- **`STATIC_ERROR_PAGE`** —— 指向一个自定义模板的文件系统路径，适用于*所有*错误状态（400/403/404/500/503/504…）。模板可包含 `{{STATUS}}` 和 `{{REASON}}` 占位符，分别替换为状态码与原因短语。启动时解析一次：若设置了路径但文件读取失败，服务器记录错误并退出（绝不带错误配置的页面运行）；未设置时使用内置页面。
 
 内部错误细节（如存储层原始错误）不会暴露给客户端，仅记录在服务端日志。
+
+状态码：路径不存在为 `404`（包括穿过普通文件的路径，如 `/app.js/x`）；存储权限错误为 `403`；后端临时故障（限流、超时、连接错误）为 `503`；其他存储错误为 `500`；请求超过 `STATIC_TIMEOUT` 为 `504`；被拒绝的路径（路径穿越尝试）为 `400`。
 
 ## 健康检查
 
@@ -293,11 +302,11 @@ STATIC_CORS_ALLOW_CREDENTIALS=true
 
 ## 指标
 
-当 `STATIC_METRICS` 为 `true`（默认）时，`GET /metrics` 返回 Prometheus 格式的指标：请求总数、按状态码类别的响应数、响应字节总数、内存缓存命中/未命中、`static_serve_request_duration_seconds` 延迟**直方图**（生成响应所需时间），以及表示当前缓存条目数与配置容量的 `static_serve_cache_entries` / `static_serve_cache_capacity` **gauge**（两者之比即填充率）。与 `/health` 一样，它绕过 Basic Auth 与 IP 访问控制——如有暴露顾虑请在前置代理处限制，或设置 `STATIC_METRICS=false` 彻底移除该路由。采集开销对正常负载可忽略（每请求仅几个原子计数器与两次时钟读取）；`STATIC_METRICS=false` 同时跳过这部分记录，因此关闭指标在热路径上是真正零开销的。
+当 `STATIC_METRICS` 为 `true`（默认）时，`GET /metrics` 返回 Prometheus 格式的指标：请求总数、按状态码类别的响应数、响应字节总数、内存缓存命中/未命中、`static_serve_request_duration_seconds` 延迟**直方图**（生成响应所需时间），以及表示当前缓存条目数与配置容量的 `static_serve_cache_entries` / `static_serve_cache_capacity` **gauge**（两者之比即填充率；设置了 `STATIC_CACHE_MAX_BYTES` 时，capacity 仍是 `STATIC_CACHE_SIZE` 的条目数估计）。响应字节计数统计实际返回的内容字节（逻辑大小，压缩前）：`304` 与 `HEAD` 响应计 `0`，Range 响应只计请求的字节。与 `/health` 一样，它绕过 Basic Auth 与 IP 访问控制——如有暴露顾虑请在前置代理处限制，或设置 `STATIC_METRICS=false` 彻底移除该路由。采集开销对正常负载可忽略（每请求仅几个原子计数器与两次时钟读取）；`STATIC_METRICS=false` 同时跳过这部分记录，因此关闭指标在热路径上是真正零开销的。
 
 ## 存储后端
 
-所有后端均基于 [Apache OpenDAL](https://github.com/apache/opendal) 实现，并根据 `STATIC_PATH` 格式自动识别，无需额外配置标志。
+所有后端均基于 [Apache OpenDAL](https://github.com/apache/opendal) 实现，并根据 `STATIC_PATH` 格式自动识别，无需额外配置标志。所有后端都会以 `400` 拒绝包含 `..` 路径段的请求（本地文件系统还会额外校验解析后的路径——包括符号链接——仍位于根目录之下）。
 
 ### 本地文件系统
 

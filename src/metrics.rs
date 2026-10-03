@@ -133,6 +133,19 @@ pub fn record_cache_insert(new: bool, evicted: usize) {
     }
 }
 
+/// Adjust the occupancy gauge after an explicit removal (a stale entry dropped
+/// on revalidation).
+pub fn record_cache_remove() {
+    if !enabled() {
+        return;
+    }
+    // Saturating: a racing re-insert of the same key can make the gauge lag by
+    // one, and a wrapped-around u64 would be far worse than an off-by-one.
+    let _ = CACHE_ENTRIES.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
 /// Record the configured cache capacity (max entries) once at startup.
 pub fn set_cache_capacity(capacity: usize) {
     CACHE_CAPACITY.store(capacity as u64, Ordering::Relaxed);

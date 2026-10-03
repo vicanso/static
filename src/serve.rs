@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_opendal_not_found};
 use crate::metrics;
 use crate::storage::get_storage;
 use aho_corasick::AhoCorasick;
@@ -23,7 +23,9 @@ use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use bytesize::ByteSize;
+use futures_util::StreamExt;
 use httpdate::{fmt_http_date, parse_http_date};
+use opendal::Metadata;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
@@ -35,20 +37,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tinyufo::TinyUfo;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
-use tokio_util::io::ReaderStream;
 use tower_http::compression::CompressionLevel;
 
 pub static X_ORIGINAL_SIZE_HEADER_NAME: HeaderName = HeaderName::from_static("x-original-size");
-
-// Chunk size for streamed file responses (files >= STATIC_READ_MAX_SIZE).
-// tokio-util's ReaderStream defaults to 4 KiB, which means ~256 wake-ups per
-// MiB of payload — wasteful on large assets like videos, wasm bundles, and
-// fonts. 64 KiB roughly matches typical TCP send-buffer sizing and cuts the
-// wake-up / syscall count ~16x at negligible peak-memory cost per in-flight
-// body. The small/buffered path (size < STATIC_READ_MAX_SIZE) is unaffected —
-// it already returns the whole body as a single Bytes.
-const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 // Pre-built Aho-Corasick automaton over the configured HTML replacement
 // pairs. Built once at startup from STATIC_HTML_REPLACE_* env vars so each
@@ -111,18 +102,22 @@ pub fn is_compressible_content_type(content_type: &str) -> bool {
         || content_type.starts_with("image/svg+xml")
 }
 
-// Compress a buffered body with the same encoder crate (async-compression) and
-// the same 1:1 level mapping tower-http applies internally, so the cached bytes
-// match what the CompressionLayer would have produced per request. Returns
-// `None` on an unknown encoding or an encoder error — callers fall back to the
-// identity body (the layer then compresses per request as before).
-async fn compress_body(encoding: &str, level: CompressionLevel, input: &[u8]) -> Option<Bytes> {
-    let level = match level {
+// Map tower-http's compression level onto async-compression's for `encoding`,
+// exactly as the CompressionLayer does — including its one override: brotli's
+// `Default` is the crate's quality 11 (the maximum, very slow), so tower-http
+// pins it to 4 (nginx's on-the-fly default). Without the same override the
+// cached bytes would be produced at q11, far slower than the layer it mirrors.
+fn async_compression_level(encoding: &str, level: CompressionLevel) -> Level {
+    match level {
+        CompressionLevel::Default if encoding == "br" => Level::Precise(4),
         CompressionLevel::Fastest => Level::Fastest,
         CompressionLevel::Best => Level::Best,
         CompressionLevel::Precise(q) => Level::Precise(q),
         _ => Level::Default,
-    };
+    }
+}
+
+async fn compress_in_memory(encoding: &str, level: Level, input: &[u8]) -> Option<Bytes> {
     let mut out = Vec::with_capacity(input.len() / 3 + 64);
     let ok = match encoding {
         "br" => BrotliEncoder::with_quality(input, level)
@@ -140,6 +135,31 @@ async fn compress_body(encoding: &str, level: CompressionLevel, input: &[u8]) ->
         _ => false,
     };
     (ok && !out.is_empty()).then(|| Bytes::from(out))
+}
+
+// Compress a buffered body with the same encoder crate (async-compression) and
+// the same level mapping tower-http applies, so the cached bytes match what the
+// CompressionLayer would have produced per request. Returns `None` on an
+// unknown encoding or an encoder error — callers fall back to the identity body
+// (the layer then compresses per request as before).
+//
+// The encoder reads from an in-memory slice that is always ready, so the
+// future never yields: polled on an async worker it would monopolize that
+// thread for the whole compression (tens of ms for a few hundred KB) and stall
+// every other request scheduled there. It runs on the blocking pool instead.
+async fn compress_body(
+    encoding: &'static str,
+    level: CompressionLevel,
+    input: Bytes,
+) -> Option<Bytes> {
+    let level = async_compression_level(encoding, level);
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(compress_in_memory(encoding, level, &input))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 // Static HTML template for directory listing view
@@ -171,18 +191,28 @@ fn html_escape(s: &str) -> String {
 const AUTOINDEX_MAX_ENTRIES: usize = 10_000;
 
 async fn get_autoindex_html(path: &str) -> Result<String> {
-    let entry_list = get_storage()?
+    // Stream the listing rather than `list()`-ing it into a Vec: the row cap
+    // below then also caps the backend work — a 1M-key S3 prefix stops after
+    // the pages that fill AUTOINDEX_MAX_ENTRIES rows instead of fetching
+    // every page (and holding every entry) first.
+    let mut lister = get_storage()?
         .dal
-        .list(path)
+        .lister(path)
         .await
         .map_err(|e| Error::Openedal { source: e })?;
-    let mut html_rows =
-        String::with_capacity(entry_list.len().min(AUTOINDEX_MAX_ENTRIES) * 128 + 128);
+    // opendal lists the directory itself alongside its children (the root as
+    // "/", a subdirectory as "sub/"); skip it by path, not by name length.
+    let self_path = path.trim_matches('/');
+    let mut html_rows = String::with_capacity(16 * 1024);
     let mut shown = 0usize;
     let mut truncated = false;
-    for entry in entry_list {
+    while let Some(entry) = lister.next().await {
+        let entry = entry.map_err(|e| Error::Openedal { source: e })?;
+        if entry.path().trim_matches('/') == self_path {
+            continue;
+        }
         let name = entry.name();
-        if name.len() <= 1 || name.starts_with('.') {
+        if name.is_empty() || name.starts_with('.') {
             continue;
         }
         // Hide pre-compressed siblings — they are an encoding detail, not
@@ -241,12 +271,21 @@ async fn get_autoindex_html(path: &str) -> Result<String> {
     Ok(WEB_HTML.replace("{{CONTENT}}", &html_rows))
 }
 
-// The two 304 predicates, shared verbatim between `static_serve` (which builds
-// the 304 response) and `load_file` (which uses them to skip the body read for
-// a request that is guaranteed to 304) — sharing the exact functions is what
+// The 304 predicates, shared verbatim between `static_serve` (which builds the
+// 304 response) and `load_file` (which uses them to skip the body read for a
+// request that is guaranteed to 304) — sharing the exact functions is what
 // makes the skip safe: the decisions cannot drift apart.
+
+// If-None-Match uses the *weak* comparison (RFC 9110 §13.1.2): opaque tags are
+// compared with any `W/` prefix ignored on both sides. A strong tag the client
+// echoes back weakened — nginx weakens ETags when it gzips a response, so
+// clients behind it send `W/"abc"` for our `"abc"` — still matches.
 fn if_none_match_hit(if_none_match: &str, etag: &str) -> bool {
-    if_none_match == "*" || if_none_match.split(',').any(|v| v.trim() == etag)
+    fn opaque(tag: &str) -> &str {
+        tag.strip_prefix("W/").unwrap_or(tag)
+    }
+    let etag = opaque(etag);
+    if_none_match.trim() == "*" || if_none_match.split(',').any(|v| opaque(v.trim()) == etag)
 }
 
 fn if_modified_since_hit(ims: &str, last_modified_secs: i64) -> bool {
@@ -256,32 +295,47 @@ fn if_modified_since_hit(ims: &str, last_modified_secs: i64) -> bool {
         .is_some_and(|d| last_modified_secs <= d.as_secs() as i64)
 }
 
+// Does this request's conditional pair guarantee a 304 against the given
+// validators? If-None-Match, when present, is the *only* test: RFC 9110
+// §13.2.2 requires If-Modified-Since to be ignored then. Falling through to the
+// date on an ETag mismatch would 304 a changed file whose mtime did not move —
+// routine with reproducible builds (Nix, Bazel, SOURCE_DATE_EPOCH) that stamp
+// every file with a constant mtime — pinning clients to stale content.
+fn not_modified(
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+    etag: Option<&str>,
+    last_modified_secs: Option<i64>,
+) -> bool {
+    if let Some(inm) = if_none_match {
+        return etag.is_some_and(|etag| if_none_match_hit(inm, etag));
+    }
+    match (if_modified_since, last_modified_secs) {
+        (Some(ims), Some(lm)) => if_modified_since_hit(ims, lm),
+        _ => false,
+    }
+}
+
 // Would this request's conditional headers already guarantee a 304 against the
-// given validators? Mirrors `static_serve`'s two independent checks (ETag
-// first, then Last-Modified).
+// given validators? The same `not_modified` decision static_serve makes.
 fn conditional_not_modified(
     params: &StaticServeParams,
     etag: Option<&str>,
     last_modified_secs: Option<i64>,
 ) -> bool {
-    if let Some(inm) = params.if_none_match.as_deref()
-        && let Some(etag) = etag
-        && if_none_match_hit(inm, etag)
-    {
-        return true;
-    }
-    if let Some(ims) = params.if_modified_since.as_deref()
-        && let Some(lm) = last_modified_secs
-        && if_modified_since_hit(ims, lm)
-    {
-        return true;
-    }
-    false
+    not_modified(
+        params.if_none_match.as_deref(),
+        params.if_modified_since.as_deref(),
+        etag,
+        last_modified_secs,
+    )
 }
 
-// RFC 7233: a Range request guarded by `If-Range` is only honored when the
-// validator still matches; otherwise the whole representation is returned.
-// A weak validator MUST NOT be used here, so weak ETags never satisfy it.
+// RFC 9110 §13.1.5: a Range request guarded by `If-Range` is only honored when
+// the validator still matches; otherwise the whole representation is returned.
+// A weak validator MUST NOT be used here, so weak ETags never satisfy it, and a
+// date validator must *exactly* match Last-Modified — a date merely newer than
+// the file is not proof the client holds these bytes.
 fn if_range_satisfied(if_range: &str, etag: Option<&str>, last_modified_secs: Option<i64>) -> bool {
     let v = if_range.trim();
     if v.is_empty() || v.starts_with("W/") {
@@ -293,7 +347,7 @@ fn if_range_satisfied(if_range: &str, etag: Option<&str>, last_modified_secs: Op
     match (parse_http_date(v), last_modified_secs) {
         (Ok(t), Some(lm)) => t
             .duration_since(UNIX_EPOCH)
-            .is_ok_and(|d| d.as_secs() as i64 >= lm),
+            .is_ok_and(|d| d.as_secs() as i64 == lm),
         _ => false,
     }
 }
@@ -356,6 +410,28 @@ impl EncodingPrefs {
             Some(q) => q > 0.0,
             None => self.wildcard.is_some_and(|q| q > 0.0),
         }
+    }
+
+    // The accepted negotiable encodings as an `ENC_*` bit set.
+    fn accepted_mask(&self) -> u8 {
+        NEGOTIABLE_ENCODINGS
+            .iter()
+            .filter(|enc| self.accepts(enc))
+            .fold(0, |mask, enc| mask | encoding_bit(enc))
+    }
+}
+
+// Negotiable encodings in server preference order, and one bit per encoding
+// for the `ruled_out` sets carried by identity cache entries.
+const NEGOTIABLE_ENCODINGS: [&str; 3] = ["br", "zstd", "gzip"];
+const ENC_ALL: u8 = 0b111;
+
+fn encoding_bit(encoding: &str) -> u8 {
+    match encoding {
+        "br" => 0b001,
+        "zstd" => 0b010,
+        "gzip" => 0b100,
+        _ => 0,
     }
 }
 
@@ -423,12 +499,86 @@ struct FileInfo {
     size: u64,
     read_file: String,
     last_modified_secs: Option<i64>,
+    // What `stat(read_file)` reported when this entry was built. A cached
+    // streamed entry (body == None) re-stats and compares before reusing its
+    // headers — see `still_fresh`.
+    fingerprint: StatFingerprint,
+    // Identity entries only: the `ENC_*` encodings known to resolve to this
+    // same identity response (no pre-compressed sibling found, and cached
+    // compression not applicable or not worthwhile). An identity hit for a
+    // client accepting an encoding *outside* this set is treated as a miss,
+    // so a better variant can still be discovered — otherwise whichever client
+    // came first (a curl without Accept-Encoding, a health checker) would pin
+    // the identity entry and hide the `.br` sibling / cached compression from
+    // every later client for the whole TTL.
+    ruled_out: u8,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct StatFingerprint {
+    size: u64,
+    last_modified_ms: Option<i64>,
+    etag: Option<String>,
+}
+
+impl StatFingerprint {
+    fn of(meta: &Metadata) -> Self {
+        Self {
+            size: meta.content_length(),
+            last_modified_ms: meta
+                .last_modified()
+                .map(|lm| lm.into_inner().as_millisecond()),
+            etag: meta.etag().map(str::to_string),
+        }
+    }
+}
+
+// Cache weights: by entry count (each entry weighs 1, `STATIC_CACHE_SIZE` is
+// the limit) or, when `STATIC_CACHE_MAX_BYTES` is set, by body bytes — each
+// entry weighs its body size in KiB (TinyUFO weights are u16, so KiB units
+// cover entries up to 64 MiB) and the limit is the byte budget in KiB.
+// Metadata-only and negative entries weigh 1 either way.
+static CACHE_MAX_BYTES: OnceLock<Option<u64>> = OnceLock::new();
 
 static STATIC_CACHE: OnceLock<TinyUfo<String, FileInfoCache>> = OnceLock::new();
 
+const CACHE_WEIGHT_UNIT: u64 = 1024;
+
+// Build the cache once at startup. `entries` sizes TinyUFO's internal tables
+// (and is the limit in count mode); `max_bytes` switches to byte weighting.
+pub fn init_cache(entries: usize, max_bytes: Option<u64>) {
+    let _ = CACHE_MAX_BYTES.set(max_bytes);
+    if entries > 0 {
+        get_static_cache(entries);
+    }
+}
+
 fn get_static_cache(size: usize) -> &'static TinyUfo<String, FileInfoCache> {
-    STATIC_CACHE.get_or_init(|| TinyUfo::new(size, size))
+    STATIC_CACHE.get_or_init(|| match CACHE_MAX_BYTES.get().copied().flatten() {
+        Some(max_bytes) => {
+            let limit = (max_bytes / CACHE_WEIGHT_UNIT).max(1) as usize;
+            TinyUfo::new(limit, size)
+        }
+        None => TinyUfo::new(size, size),
+    })
+}
+
+fn cache_weight(value: &CacheValue) -> u16 {
+    if CACHE_MAX_BYTES.get().copied().flatten().is_none() {
+        return 1;
+    }
+    match value {
+        CacheValue::Found(info) => info.body.as_ref().map_or(1, |b| body_weight(b.len())),
+        CacheValue::NotFound => 1,
+    }
+}
+
+// A body's weight in byte-budget mode: its size in KiB, rounded up, clamped to
+// TinyUFO's u16 weight range (and never 0).
+fn body_weight(len: usize) -> u16 {
+    (len as u64)
+        .div_ceil(CACHE_WEIGHT_UNIT)
+        .clamp(1, u16::MAX as u64) as u16
 }
 
 // Cache keys are encoding-aware: the same logical path is stored once per
@@ -486,15 +636,23 @@ fn set_file_to_cache(key: String, value: CacheValue, cache_size: usize, cache_tt
     // make room; subtract those. The pre-`put` lookup exists solely to feed the
     // gauge, so skip it when metrics are off (short-circuits before the `get`).
     let is_new = metrics::enabled() && cache.get(&key).is_none();
+    let weight = cache_weight(&value);
     let evicted = cache.put(
         key,
         FileInfoCache {
             expired_at,
             data: value,
         },
-        1,
+        weight,
     );
     metrics::record_cache_insert(is_new, evicted.len());
+}
+
+// Drop an entry found to be stale, keeping the occupancy gauge in step.
+fn remove_from_cache(key: &String, cache_size: usize) {
+    if get_static_cache(cache_size).remove(key).is_some() {
+        metrics::record_cache_remove();
+    }
 }
 
 // Negative-cache a 404 (opt-in via STATIC_NOT_FOUND_CACHE_TTL). Keyed by the
@@ -599,11 +757,16 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     let accept_prefs = params.accept_encoding.as_deref().map(EncodingPrefs::parse);
 
     // Encoding-aware cache lookup. Probe each encoding the client accepts in
-    // priority order (br > zstd > gzip), then identity. The first hit returns a
-    // fully built FileInfo (correct Content-Encoding + body) and skips the
-    // validate / `stat` / sibling-probe round-trips below. Probing a variant
+    // priority order (br > zstd > gzip), then identity. The first usable hit
+    // returns a fully built FileInfo (correct Content-Encoding + body) and skips
+    // the validate / `stat` / sibling-probe round-trips below. Probing a variant
     // that was never cached is a cheap in-memory miss, so unsupported paths
     // (e.g. HTML, which is never cached) simply fall through to the slow path.
+    //
+    // `prior_ruled_out` carries an identity entry's ruled-out set into the
+    // reload it triggers, so clients with disjoint Accept-Encoding sets
+    // converge on one identity entry instead of evicting each other's knowledge.
+    let mut prior_ruled_out = 0u8;
     if params.cache_size > 0 {
         // Reuse a single key buffer across every probe instead of allocating a
         // fresh String per encoding (up to 4 per request). The `<path>\0` prefix
@@ -617,25 +780,49 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         // Read the clock once for the whole probe sequence: every key shares the
         // same expiry cutoff, and the probes run within microseconds.
         let now_secs = now_unix_secs();
-        if let Some(prefs) = &accept_prefs {
-            for enc in ["br", "zstd", "gzip"] {
-                if prefs.accepts(enc) {
-                    key.truncate(prefix_len);
-                    key.push_str(enc);
-                    if let Some(hit) = get_file_from_cache(&key, params.cache_size, now_secs) {
-                        metrics::record_cache_hit();
-                        return cached_result(hit, &file);
-                    }
-                }
-            }
-        }
-        // identity: empty suffix (back to just `<path>\0`). Negative (404)
-        // entries live only under this key, so they are reached regardless of
+        let accepted = accept_prefs
+            .as_ref()
+            .map_or(0, EncodingPrefs::accepted_mask);
+        let negotiates_variants = params.precompressed || params.compress_cache;
+        // identity is the empty suffix (back to just `<path>\0`). Negative
+        // (404) entries live only under it, so they are reached regardless of
         // what the client accepts.
-        key.truncate(prefix_len);
-        if let Some(hit) = get_file_from_cache(&key, params.cache_size, now_secs) {
+        let candidates = NEGOTIABLE_ENCODINGS
+            .into_iter()
+            .filter(|enc| accepted & encoding_bit(enc) != 0)
+            .chain([""]);
+        for enc in candidates {
+            key.truncate(prefix_len);
+            key.push_str(enc);
+            let info = match get_file_from_cache(&key, params.cache_size, now_secs) {
+                None => continue,
+                Some(CacheValue::Found(info)) => info,
+                Some(hit) => {
+                    metrics::record_cache_hit();
+                    return cached_result(hit, &file);
+                }
+            };
+            // An identity entry is only authoritative for the encodings it has
+            // ruled out. This client accepts one it hasn't (e.g. the entry was
+            // built for a client that sent no Accept-Encoding, so the `.br`
+            // sibling was never probed): reload, which may find a better
+            // variant and cache it under its own key.
+            if enc.is_empty() && negotiates_variants && accepted & !info.ruled_out != 0 {
+                prior_ruled_out = info.ruled_out;
+                break;
+            }
+            // A streamed entry's headers (Content-Length, ETag) describe bytes
+            // that are re-read from the backend on every request. If the file
+            // was overwritten since, reusing them would truncate or corrupt the
+            // body, so revalidate with one `stat` (negligible next to streaming
+            // a file >= STATIC_READ_MAX_SIZE) and reload on any change.
+            // Buffered entries carry their own bytes and stay self-consistent.
+            if info.body.is_none() && !still_fresh(&info).await {
+                remove_from_cache(&key, params.cache_size);
+                break;
+            }
             metrics::record_cache_hit();
-            return cached_result(hit, &file);
+            return Ok(info);
         }
         metrics::record_cache_miss();
     }
@@ -668,7 +855,7 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
         if let Some(info) = flight.result() {
             return Ok(info);
         }
-        let res = load_file(params, file, &accept_prefs)
+        let res = load_file(params, file, &accept_prefs, prior_ruled_out)
             .await
             .map(|(info, _)| info);
         maybe_cache_not_found(params, &res);
@@ -681,7 +868,7 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     // a dead flight behind. Publish happens before the guard drops, so woken
     // followers always observe the result.
     let guard = FlightGuard { key: sf_key };
-    let res = load_file(params, file, &accept_prefs).await;
+    let res = load_file(params, file, &accept_prefs, prior_ruled_out).await;
     if let Ok((info, share)) = &res
         && *share
     {
@@ -703,6 +890,40 @@ async fn get_file(params: &StaticServeParams) -> Result<Arc<FileInfo>> {
     res
 }
 
+// Does the backend object behind a cached entry still match the `stat` the
+// entry was built from? Any error (including the file having been deleted)
+// counts as stale, so the caller reloads and surfaces the real outcome.
+async fn still_fresh(info: &FileInfo) -> bool {
+    let Ok(storage) = get_storage() else {
+        return false;
+    };
+    storage
+        .dal
+        .stat(&info.read_file)
+        .await
+        .is_ok_and(|meta| StatFingerprint::of(&meta) == info.fingerprint)
+}
+
+// The ruled-out set of a freshly loaded identity entry (see
+// `FileInfo::ruled_out`): an encoding is ruled out when it is out on the
+// sibling front (`siblings_absent`: no sibling, or sibling negotiation not
+// applicable) *and* on the compression front (cached compression not
+// applicable to this body, or tried and rejected). `prior` — the set of the
+// identity entry this load replaces — is merged in.
+fn identity_ruled_out(
+    siblings_absent: u8,
+    compress_eligible: bool,
+    compress_rejected: bool,
+    prior: u8,
+) -> u8 {
+    let compress_out = if !compress_eligible || compress_rejected {
+        ENC_ALL
+    } else {
+        0
+    };
+    (siblings_absent & compress_out) | prior
+}
+
 // Join a directory path and an index filename, inserting a single '/' only when
 // the directory part lacks a trailing one. Shared by the optimistic index probe
 // and the directory fallback so both target byte-identical backend keys (the
@@ -720,28 +941,39 @@ fn join_index(dir: &str, index: &str) -> String {
 // skipped because the request's conditionals guarantee a 304 — such a result
 // is valid only for THIS request and must not be published to single-flight
 // followers or cached (both enforced by the callers/`will_cache`).
+// `prior_ruled_out` is the ruled-out set of the identity entry whose
+// insufficiency triggered this load (0 otherwise); see `FileInfo::ruled_out`.
 async fn load_file(
     params: &StaticServeParams,
     mut file: String,
     accept_prefs: &Option<EncodingPrefs>,
+    prior_ruled_out: u8,
 ) -> Result<(Arc<FileInfo>, bool)> {
     let storage = get_storage()?;
-    storage.validate(&file)?;
+    storage.validate(&file).await?;
 
-    // Optimistic index resolution. For a trailing-slash directory request with
-    // autoindex off and an index file configured, `<dir>/<index>` almost always
-    // exists and the directory's own metadata is then thrown away. Stat the
-    // index directly: on a hit we skip the separate directory stat entirely (one
-    // backend round-trip instead of two — significant on remote backends like
-    // S3/FTP/GridFS, negligible on local FS). The trailing-slash guard is also a
-    // correctness condition: a directory reached *without* the slash must 301
-    // first (below), which requires stat'ing the directory itself. On a NotFound
-    // miss we fall back to the normal directory stat and skip re-probing the
-    // index (`index_missing`); a non-NotFound error is the only servable target
-    // failing, so it propagates rather than masking a 5xx as a 404.
+    // Optimistic index resolution. For a directory-style candidate (trailing
+    // slash, or the empty root) with autoindex off and an index file
+    // configured, `<dir>/<index>` almost always exists and the directory's own
+    // metadata is then thrown away. Stat the index directly: on a hit we skip
+    // the separate directory stat entirely (one backend round-trip instead of
+    // two — significant on remote backends like S3/FTP/GridFS, negligible on
+    // local FS). The trailing-slash guard is also a correctness condition: a
+    // directory reached *without* the slash must 301 first (below), which
+    // requires stat'ing the directory itself. On a not-found miss we fall back
+    // to the normal directory stat and skip re-probing the index
+    // (`index_missing`); any other error is the only servable target failing,
+    // so it propagates rather than masking a 5xx as a 404.
+    //
+    // The guard looks at the *candidate* path, not the request path: the
+    // fallback loop in main.rs re-enters here with `index.html` (or
+    // `<path>.html`) while the request path still ends in '/', and probing
+    // `index.html/index.html` fails with ENOTDIR — which used to abort the SPA
+    // fallback for every trailing-slash route.
+    let dir_candidate = file.is_empty() || file.ends_with('/');
     let mut index_meta = None;
     let mut index_missing = false;
-    if params.request_path.ends_with('/') && !params.autoindex && !params.index.is_empty() {
+    if dir_candidate && !params.autoindex && !params.index.is_empty() {
         let index_path = join_index(&file, &params.index);
         match storage.dal.stat(&index_path).await {
             Ok(m) if m.is_file() => {
@@ -751,7 +983,7 @@ async fn load_file(
             // Index path is itself a directory (rare): fall back to the normal
             // directory handling below, which resolves it as it does today.
             Ok(_) => {}
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => index_missing = true,
+            Err(e) if is_opendal_not_found(&e) => index_missing = true,
             Err(e) => return Err(Error::Openedal { source: e }),
         }
     }
@@ -799,6 +1031,8 @@ async fn load_file(
             body: Some(body),
             read_file: file.clone(),
             last_modified_secs: None,
+            fingerprint: StatFingerprint::default(),
+            ruled_out: ENC_ALL,
         };
         return Ok((Arc::new(info), true));
     }
@@ -876,21 +1110,33 @@ async fn load_file(
     // files that were never pre-compressed.
     let mut precompressed_file = None;
     let mut negotiated_encoding: &'static str = "";
-    if params.precompressed
-        && let Some(prefs) = accept_prefs
-        && !is_html
-        && !is_dir
-    {
-        let candidates: &[(&str, &str)] = &[("br", ".br"), ("zstd", ".zst"), ("gzip", ".gz")];
-        for (encoding, ext) in candidates {
+    // Sibling-probe outcome for the identity entry's ruled-out set: when
+    // sibling negotiation doesn't apply to this file at all, every encoding is
+    // ruled out on that front; otherwise only the ones whose sibling a probe
+    // definitively found missing.
+    let sibling_eligible = params.precompressed && !is_html && !is_dir;
+    let mut siblings_absent = if sibling_eligible { 0u8 } else { ENC_ALL };
+    if sibling_eligible && let Some(prefs) = accept_prefs {
+        let candidates: &[(&'static str, &str)] =
+            &[("br", ".br"), ("zstd", ".zst"), ("gzip", ".gz")];
+        for &(encoding, ext) in candidates {
             if prefs.accepts(encoding) {
                 let compressed = format!("{file}{ext}");
-                if let Ok(compressed_meta) = storage.dal.stat(&compressed).await {
-                    precompressed_file = Some(compressed);
-                    meta = compressed_meta;
-                    headers.push((header::CONTENT_ENCODING, HeaderValue::from_static(encoding)));
-                    negotiated_encoding = encoding;
-                    break;
+                match storage.dal.stat(&compressed).await {
+                    Ok(compressed_meta) => {
+                        precompressed_file = Some(compressed);
+                        meta = compressed_meta;
+                        headers
+                            .push((header::CONTENT_ENCODING, HeaderValue::from_static(encoding)));
+                        negotiated_encoding = encoding;
+                        break;
+                    }
+                    Err(e) if is_opendal_not_found(&e) => {
+                        siblings_absent |= encoding_bit(encoding);
+                    }
+                    // A transient probe failure proves nothing — leave the
+                    // encoding open so a later request probes it again.
+                    Err(_) => {}
                 }
             }
         }
@@ -948,7 +1194,14 @@ async fn load_file(
     } else {
         params.cache_ttl
     };
-    let will_cache = params.cache_size > 0 && !params.head && !entry_ttl.is_zero();
+    // HTML is buffered whatever its size (the replacer needs the whole body),
+    // but one at or over STATIC_READ_MAX_SIZE is not cached: that cap is what
+    // bounds the memory of every other cached body, and without it a single
+    // large HTML page would sit in the cache uncapped.
+    let will_cache = params.cache_size > 0
+        && !params.head
+        && !entry_ttl.is_zero()
+        && !(is_html && size >= params.read_max_size);
 
     // Conditional short-circuit: when the request's validators already
     // guarantee a 304 (same predicate functions static_serve re-checks against
@@ -963,9 +1216,15 @@ async fn load_file(
     let not_modified =
         !will_cache && conditional_not_modified(params, etag.as_deref(), last_modified_secs);
 
-    // read html or small file
+    // read html or small file. A HEAD skips the body — except HTML with
+    // replacements configured: the replaced body's length is what a GET
+    // reports as Content-Length, and the stat size would not match it.
     let read_file = precompressed_file.as_deref().unwrap_or(&file);
-    let mut body = if !params.head && !not_modified && (is_html || size < params.read_max_size) {
+    let head_needs_body = is_html && params.html_replacer.is_some();
+    let mut body = if (!params.head || head_needs_body)
+        && !not_modified
+        && (is_html || size < params.read_max_size)
+    {
         let buffer = storage
             .dal
             .read(read_file)
@@ -997,32 +1256,57 @@ async fn load_file(
     // pre-compressed sibling or a backend-set Content-Encoding wins). The
     // resulting Content-Encoding header makes the CompressionLayer skip this
     // response.
-    if params.compress_cache
+    let compress_eligible = params.compress_cache
         && will_cache
         && negotiated_encoding.is_empty()
         && compressible
         && !headers.iter().any(|(k, _)| *k == header::CONTENT_ENCODING)
+        && body
+            .as_ref()
+            .is_some_and(|b| b.len() >= params.compress_min_length as usize);
+    // Whether compression was tried for this client and kept identity (it
+    // didn't shrink the body, or the encoder failed). The best encoding
+    // standing in for the rest is deliberate: a body brotli can't shrink won't
+    // shrink under gzip either.
+    let mut compress_rejected = false;
+    if compress_eligible
         && let Some(prefs) = accept_prefs
-        && let Some(b) = &body
-        && b.len() >= params.compress_min_length as usize
+        && let Some(b) = body.clone()
     {
         // Best accepted encoding only — each encoding is its own cache entry,
         // so a client with different preferences populates its own variant.
-        for enc in ["br", "zstd", "gzip"] {
-            if prefs.accepts(enc) {
-                // Keep identity when compression doesn't actually shrink the
-                // body — an entry that is no smaller isn't worth the decode.
-                if let Some(compressed) = compress_body(enc, params.compress_level, b).await
-                    && compressed.len() < b.len()
-                {
+        if let Some(enc) = NEGOTIABLE_ENCODINGS
+            .into_iter()
+            .find(|enc| prefs.accepts(enc))
+        {
+            // Keep identity when compression doesn't actually shrink the
+            // body — an entry that is no smaller isn't worth the decode.
+            match compress_body(enc, params.compress_level, b.clone()).await {
+                Some(compressed) if compressed.len() < b.len() => {
                     headers.push((header::CONTENT_ENCODING, HeaderValue::from_static(enc)));
                     negotiated_encoding = enc;
                     body = Some(compressed);
                 }
-                break;
+                _ => compress_rejected = true,
             }
         }
     }
+    // For an identity result, the encodings a later client could accept and
+    // still get exactly this response: ruled out on the sibling front (no
+    // sibling, or siblings not applicable) *and* on the compression front
+    // (cached compression not applicable, or tried and rejected). Merged with
+    // the set of the identity entry this load replaces, so knowledge gathered
+    // from differently-negotiating clients accumulates instead of thrashing.
+    let ruled_out = if negotiated_encoding.is_empty() {
+        identity_ruled_out(
+            siblings_absent,
+            compress_eligible,
+            compress_rejected,
+            prior_ruled_out,
+        )
+    } else {
+        0
+    };
 
     // Content-Length reflects the bytes actually served: the (possibly
     // replaced/compressed) buffered body, or the stat size for streamed files.
@@ -1046,6 +1330,8 @@ async fn load_file(
         size,
         read_file: read_path,
         last_modified_secs,
+        fingerprint: StatFingerprint::of(&meta),
+        ruled_out,
     });
     if will_cache {
         // HTML is cached only when STATIC_HTML_CACHE_TTL opted in (clients
@@ -1089,12 +1375,12 @@ fn store_not_found_page(result: Option<Bytes>, ttl: Duration) {
 }
 
 // Fetch the custom 404 page (`404.html` in the storage root), caching both the
-// body and its absence for `cache_ttl` (zero = uncached, the historical
-// behavior). Only definitive outcomes are cached — a transient backend error
-// yields an uncached `None` so the page is not remembered as missing for a
-// whole TTL. The caller passes max(not_found_cache_ttl, html_cache_ttl): both
-// are the existing ≤5-minute bounded-staleness opt-ins, and opting into either
-// means accepting a short window of 404-page staleness.
+// body and its absence for `cache_ttl` (zero = uncached). Only definitive
+// outcomes are cached — a transient backend error yields an uncached `None` so
+// the page is not remembered as missing for a whole TTL. The caller passes
+// `Config::not_found_page_ttl`: max(not_found_cache_ttl, html_cache_ttl) when
+// either short-cache opt-in is set, else a 10s default — so a path-scanning bot
+// costs one backend lookup per 10s rather than one per 404.
 pub async fn not_found_page(cache_ttl: Duration) -> Option<Bytes> {
     if !cache_ttl.is_zero()
         && let Some(cached) = cached_not_found_page(now_unix_secs())
@@ -1113,7 +1399,7 @@ pub async fn not_found_page(cache_ttl: Duration) -> Option<Bytes> {
             body
         }
         Err(e) => {
-            if e.kind() == opendal::ErrorKind::NotFound && !cache_ttl.is_zero() {
+            if is_opendal_not_found(&e) && !cache_ttl.is_zero() {
                 store_not_found_page(None, cache_ttl);
             }
             None
@@ -1313,36 +1599,34 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         .map(|b| b.len() as u64)
         .unwrap_or(file_info.size);
 
-    // 304 Not Modified — the same predicate functions load_file consulted to
-    // decide whether the body read could be skipped.
-    if let Some(if_none_match) = params.if_none_match.as_deref()
-        && let Some((_, etag_value)) = file_info.headers.iter().find(|(k, _)| *k == header::ETAG)
-        && if_none_match_hit(if_none_match, etag_value.to_str().unwrap_or_default())
-    {
+    // 304 Not Modified — the same `not_modified` decision load_file consulted
+    // to decide whether the body read could be skipped. X-Original-Size feeds
+    // the byte metrics / access log: a 304 carries no body, so it reports 0
+    // rather than the file size.
+    let etag = file_info
+        .headers
+        .iter()
+        .find(|(k, _)| *k == header::ETAG)
+        .and_then(|(_, v)| v.to_str().ok());
+    if not_modified(
+        params.if_none_match.as_deref(),
+        params.if_modified_since.as_deref(),
+        etag,
+        file_info.last_modified_secs,
+    ) {
         let mut resp = StatusCode::NOT_MODIFIED.into_response();
         resp.headers_mut().extend(
             file_info
                 .headers
                 .iter()
-                .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING)
+                .filter(|(k, _)| {
+                    *k != header::CONTENT_LENGTH
+                        && *k != header::CONTENT_ENCODING
+                        && *k != X_ORIGINAL_SIZE_HEADER_NAME
+                })
                 .cloned(),
         );
-        return Ok(resp);
-    }
-
-    // 304 Not Modified (If-Modified-Since)
-    if let Some(ims) = params.if_modified_since.as_deref()
-        && let Some(secs) = file_info.last_modified_secs
-        && if_modified_since_hit(ims, secs)
-    {
-        let mut resp = StatusCode::NOT_MODIFIED.into_response();
-        resp.headers_mut().extend(
-            file_info
-                .headers
-                .iter()
-                .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::CONTENT_ENCODING)
-                .cloned(),
-        );
+        set_logical_size(&mut resp, 0);
         return Ok(resp);
     }
 
@@ -1350,6 +1634,7 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
     if params.head {
         let mut resp = Response::new(Body::empty());
         resp.headers_mut().extend(file_info.headers.iter().cloned());
+        set_logical_size(&mut resp, 0);
         return Ok(resp);
     }
 
@@ -1358,14 +1643,7 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
     // file is not silently corrupted.
     let honor_range = match params.if_range.as_deref() {
         None => true,
-        Some(ir) => {
-            let etag = file_info
-                .headers
-                .iter()
-                .find(|(k, _)| *k == header::ETAG)
-                .and_then(|(_, v)| v.to_str().ok());
-            if_range_satisfied(ir, etag, file_info.last_modified_secs)
-        }
+        Some(ir) => if_range_satisfied(ir, etag, file_info.last_modified_secs),
     };
     let ranges = if honor_range {
         params
@@ -1410,6 +1688,7 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
                 .filter(|(k, _)| *k != header::CONTENT_LENGTH)
                 .cloned(),
         );
+        set_logical_size(&mut resp, 0);
         return Ok(resp);
     }
 
@@ -1418,26 +1697,17 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         _ => None,
     };
     let is_multipart = matches!(&ranges, Some(RangesValue::Ranges(rs)) if rs.len() > 1);
-    let is_partial = single_range.is_some() || is_multipart;
+    // Body bytes of a partial response (the range, or the multipart payload) —
+    // what the byte metrics should count instead of the whole file.
+    let mut partial_len = None;
 
     let mut resp = if let Some((start, end)) = single_range {
         let content_length = end - start + 1;
+        partial_len = Some(content_length);
         let mut resp = if let Some(body) = file_info.body.as_ref() {
             body.slice(start as usize..=end as usize).into_response()
         } else {
-            let r = get_storage()?
-                .dal
-                .reader(&file_info.read_file)
-                .await
-                .map_err(|e| Error::Openedal { source: e })?;
-            let stream = ReaderStream::with_capacity(
-                r.into_futures_async_read(start..=end)
-                    .await
-                    .map_err(|e| Error::Openedal { source: e })?
-                    .compat(),
-                STREAM_CHUNK_SIZE,
-            );
-            Body::from_stream(stream).into_response()
+            stream_body(&file_info.read_file, start..end + 1).await?
         };
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         resp.headers_mut().insert(
@@ -1457,6 +1727,7 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         let boundary = next_multipart_boundary(total_size);
         let payload = build_multipart_byteranges(&file_info, rs, total_size, &boundary).await?;
         let content_length = payload.len();
+        partial_len = Some(content_length as u64);
         let mut resp = payload.into_response();
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         resp.headers_mut().insert(
@@ -1473,19 +1744,10 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
     } else if let Some(body) = file_info.body.as_ref() {
         body.clone().into_response()
     } else {
-        let r = get_storage()?
-            .dal
-            .reader(&file_info.read_file)
-            .await
-            .map_err(|e| Error::Openedal { source: e })?;
-        let stream = ReaderStream::with_capacity(
-            r.into_futures_async_read(0..)
-                .await
-                .map_err(|e| Error::Openedal { source: e })?
-                .compat(),
-            STREAM_CHUNK_SIZE,
-        );
-        Body::from_stream(stream).into_response()
+        // Bounded to the stat size the headers advertise: if the file grows
+        // between the revalidating stat and this read, the body still matches
+        // Content-Length instead of overrunning it.
+        stream_body(&file_info.read_file, 0..file_info.size).await?
     };
 
     // Copy our computed headers onto the response, overwriting rather than
@@ -1500,7 +1762,7 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
     // Content-Encoding — exclude all three from the copy here.
     let resp_headers = resp.headers_mut();
     for (k, v) in file_info.headers.iter() {
-        if is_partial && *k == header::CONTENT_LENGTH {
+        if partial_len.is_some() && *k == header::CONTENT_LENGTH {
             continue;
         }
         if is_multipart && (*k == header::CONTENT_TYPE || *k == header::CONTENT_ENCODING) {
@@ -1508,8 +1770,33 @@ pub async fn static_serve(params: &StaticServeParams) -> Result<Response> {
         }
         resp_headers.insert(k, v.clone());
     }
+    if let Some(len) = partial_len {
+        set_logical_size(&mut resp, len);
+    }
 
     Ok(resp)
+}
+
+// Stream `range` of a backend object as the response body. opendal's byte
+// stream hands its read buffers (up to 2 MiB per local-FS read, or the
+// configured concurrent chunk size) straight to hyper as `Bytes` — no
+// AsyncRead adapter re-copying every chunk into a second buffer.
+async fn stream_body(path: &str, range: std::ops::Range<u64>) -> Result<Response> {
+    let stream = get_storage()?
+        .reader(path)
+        .await
+        .map_err(|e| Error::Openedal { source: e })?
+        .into_bytes_stream(range)
+        .await
+        .map_err(|e| Error::Openedal { source: e })?;
+    Ok(Body::from_stream(stream).into_response())
+}
+
+// Overwrite the internal X-Original-Size marker (stripped before the response
+// leaves the server) with the body bytes this response actually carries.
+fn set_logical_size(resp: &mut Response, len: u64) {
+    resp.headers_mut()
+        .insert(X_ORIGINAL_SIZE_HEADER_NAME.clone(), HeaderValue::from(len));
 }
 
 #[cfg(test)]
@@ -1637,11 +1924,14 @@ mod tests {
         assert!(!if_range_satisfied("W/\"abc\"", Some("\"abc\""), None));
         assert!(!if_range_satisfied("\"abc\"", Some("W/\"abc\""), None));
 
-        // date validator: honored only when the resource is not newer than the date
-        let date_after = fmt_http_date(UNIX_EPOCH + Duration::from_secs(2000));
-        assert!(if_range_satisfied(&date_after, None, Some(1000)));
-        let date_before = fmt_http_date(UNIX_EPOCH + Duration::from_secs(500));
-        assert!(!if_range_satisfied(&date_before, None, Some(1000)));
+        // date validator: honored only on an exact Last-Modified match — a date
+        // merely newer than the file proves nothing about the client's bytes
+        let at = |secs| fmt_http_date(UNIX_EPOCH + Duration::from_secs(secs));
+        assert!(if_range_satisfied(&at(1000), None, Some(1000)));
+        assert!(!if_range_satisfied(&at(2000), None, Some(1000)));
+        assert!(!if_range_satisfied(&at(500), None, Some(1000)));
+        // no Last-Modified to compare against -> not satisfied
+        assert!(!if_range_satisfied(&at(1000), None, None));
     }
 
     #[test]
@@ -1711,6 +2001,8 @@ mod tests {
             size: 10,
             read_file: String::new(),
             last_modified_secs: None,
+            fingerprint: StatFingerprint::default(),
+            ruled_out: 0,
         };
         let ranges = [(0u64, 2u64), (5u64, 7u64)];
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1782,6 +2074,8 @@ mod tests {
             size: 1,
             read_file: "a.js".to_string(),
             last_modified_secs: None,
+            fingerprint: StatFingerprint::default(),
+            ruled_out: 0,
         });
         set_file_to_cache(
             "a.js\u{0}".to_string(),
@@ -1876,13 +2170,13 @@ mod tests {
     fn compress_body_shrinks_repetitive_input() {
         // highly repetitive input must compress under every supported encoding;
         // an unknown encoding yields None (callers keep the identity body)
-        let input = vec![b'a'; 64 * 1024];
+        let input = Bytes::from(vec![b'a'; 64 * 1024]);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("current-thread runtime");
         rt.block_on(async {
             for enc in ["br", "zstd", "gzip"] {
-                let out = compress_body(enc, CompressionLevel::Default, &input)
+                let out = compress_body(enc, CompressionLevel::Default, input.clone())
                     .await
                     .expect("supported encoding compresses");
                 assert!(
@@ -1893,7 +2187,7 @@ mod tests {
                 );
             }
             assert!(
-                compress_body("deflate", CompressionLevel::Default, &input)
+                compress_body("deflate", CompressionLevel::Default, input.clone())
                     .await
                     .is_none()
             );
@@ -1928,15 +2222,23 @@ mod tests {
         // no stored ETag -> the INM arm can't hit
         assert!(!conditional_not_modified(&params, None, Some(1000)));
 
-        // IMS arm hits when INM missed (mirrors static_serve's two checks)
+        // If-None-Match present: If-Modified-Since is ignored (RFC 9110
+        // §13.2.2) — an ETag mismatch must not be rescued by an unchanged mtime
         params.if_modified_since = Some(Arc::from(
             fmt_http_date(UNIX_EPOCH + Duration::from_secs(2000)).as_str(),
         ));
-        assert!(conditional_not_modified(
+        assert!(!conditional_not_modified(
             &params,
             Some("\"other\""),
             Some(1000)
         ));
+        // ...even when there is no ETag to compare at all
+        assert!(!conditional_not_modified(&params, None, Some(1000)));
+
+        // If-Modified-Since alone decides when If-None-Match is absent
+        params.if_none_match = None;
+        assert!(conditional_not_modified(&params, None, Some(1000)));
+        assert!(!conditional_not_modified(&params, None, Some(3000)));
 
         // no conditional headers at all -> never a hit
         let bare = StaticServeParams::default();
@@ -1974,5 +2276,76 @@ mod tests {
             parse_ranges("bytes=-1000", 1000),
             Some(RangesValue::Ranges(vec![(0, 999)]))
         );
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        // a strong stored tag matches its weakened echo (nginx weakens ETags
+        // when it gzips), and vice versa
+        assert!(if_none_match_hit("W/\"abc\"", "\"abc\""));
+        assert!(if_none_match_hit("\"abc\"", "W/\"abc\""));
+        assert!(if_none_match_hit("\"x\", W/\"abc\"", "W/\"abc\""));
+        // the opaque part still has to match
+        assert!(!if_none_match_hit("W/\"xyz\"", "\"abc\""));
+        // a padded wildcard still matches
+        assert!(if_none_match_hit(" * ", "\"abc\""));
+    }
+
+    #[test]
+    fn accepted_mask_tracks_negotiable_encodings() {
+        assert_eq!(EncodingPrefs::parse("br, gzip").accepted_mask(), 0b101);
+        assert_eq!(EncodingPrefs::parse("*").accepted_mask(), ENC_ALL);
+        assert_eq!(EncodingPrefs::parse("zstd;q=0, *").accepted_mask(), 0b101);
+        assert_eq!(EncodingPrefs::parse("identity").accepted_mask(), 0);
+    }
+
+    #[test]
+    fn identity_ruled_out_combines_both_fronts() {
+        let br = encoding_bit("br");
+        let gzip = encoding_bit("gzip");
+        // neither feature applies (e.g. an image with precompressed off and
+        // compress_cache on but not compressible): everything is ruled out
+        assert_eq!(identity_ruled_out(ENC_ALL, false, false, 0), ENC_ALL);
+        // probed-absent siblings, compression not applicable: only those
+        assert_eq!(identity_ruled_out(br | gzip, false, false, 0), br | gzip);
+        // compression eligible but never tried (client accepted nothing):
+        // nothing is ruled out, so the next br client re-negotiates
+        assert_eq!(identity_ruled_out(ENC_ALL, true, false, 0), 0);
+        // compression tried and rejected (didn't shrink): ruled out
+        assert_eq!(identity_ruled_out(ENC_ALL, true, true, 0), ENC_ALL);
+        // the replaced entry's knowledge is merged in
+        assert_eq!(identity_ruled_out(gzip, false, false, br), br | gzip);
+    }
+
+    #[test]
+    fn body_weight_is_kib_rounded_up_and_clamped() {
+        assert_eq!(body_weight(0), 1);
+        assert_eq!(body_weight(1), 1);
+        assert_eq!(body_weight(1024), 1);
+        assert_eq!(body_weight(1025), 2);
+        assert_eq!(body_weight(250_000), 245);
+        assert_eq!(body_weight(usize::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn async_compression_level_matches_tower_http() {
+        // tower-http pins brotli's Default to quality 4 (the crate default is
+        // 11); every other encoding/level maps 1:1
+        assert!(matches!(
+            async_compression_level("br", CompressionLevel::Default),
+            Level::Precise(4)
+        ));
+        assert!(matches!(
+            async_compression_level("gzip", CompressionLevel::Default),
+            Level::Default
+        ));
+        assert!(matches!(
+            async_compression_level("br", CompressionLevel::Best),
+            Level::Best
+        ));
+        assert!(matches!(
+            async_compression_level("zstd", CompressionLevel::Precise(7)),
+            Level::Precise(7)
+        ));
     }
 }

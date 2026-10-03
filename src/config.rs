@@ -35,6 +35,64 @@ pub enum StartupCheck {
     Strict,
 }
 
+// STATIC_CORS_ALLOW_ORIGIN, resolved once at startup so a request only does a
+// lookup — it never re-splits the allowlist or allocates the header value.
+#[derive(Debug, Clone)]
+pub enum CorsAllowOrigin {
+    // `*` without credentials: a fixed wildcard that never varies.
+    Any,
+    // `*` with credentials, where `*` is invalid: echo the request Origin
+    // (and always vary, even when no Origin was sent).
+    EchoAny,
+    // One fixed origin, advertised to every request whether or not it
+    // matches — no per-request variance.
+    Single(HeaderValue),
+    // An allowlist: echo the request Origin when listed. Varies whenever the
+    // list has more than one entry, matching or not.
+    List(Vec<(String, HeaderValue)>),
+}
+
+impl CorsAllowOrigin {
+    pub fn parse(raw: &str, credentials: bool) -> Self {
+        let raw = raw.trim();
+        if raw == "*" {
+            return if credentials {
+                Self::EchoAny
+            } else {
+                Self::Any
+            };
+        }
+        let mut items: Vec<(String, HeaderValue)> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .filter_map(|item| match HeaderValue::from_str(item) {
+                Ok(v) => Some((item.to_string(), v)),
+                Err(_) => {
+                    warn!("Invalid STATIC_CORS_ALLOW_ORIGIN entry dropped: {item}");
+                    None
+                }
+            })
+            .collect();
+        if items.len() == 1
+            && let Some((_, v)) = items.pop()
+        {
+            return Self::Single(v);
+        }
+        Self::List(items)
+    }
+}
+
+// Default cache TTL for the custom `404.html` lookup when neither short-cache
+// opt-in is set. Without one every 404 re-read (or failed to read) the page
+// from the backend; 10s bounds that to one lookup per window while keeping
+// edits to 404.html visible almost immediately.
+const NOT_FOUND_PAGE_DEFAULT_TTL: Duration = Duration::from_secs(10);
+
+// Default chunk size for concurrent streaming reads (only used when
+// STATIC_BACKEND_READ_CONCURRENT > 1).
+const BACKEND_READ_CHUNK_DEFAULT: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub timeout: Duration,
@@ -77,12 +135,23 @@ pub struct Config {
     pub error_page: Option<String>,
     pub response_headers: HeaderMap,
     pub cache_size: usize,
+    // Optional byte budget for the in-memory cache (STATIC_CACHE_MAX_BYTES).
+    // None keeps the entry-count bound (`cache_size`); Some switches the cache
+    // to body-size weighting with this total.
+    pub cache_max_bytes: Option<u64>,
     pub cache_ttl: Duration,
     // Opt-in short cache TTLs (zero = disabled), both capped at 5 minutes:
     // negative caching of 404 lookups, and in-memory caching of HTML bodies
     // (which are otherwise never cached because deploys mutate them).
     pub not_found_cache_ttl: Duration,
     pub html_cache_ttl: Duration,
+    // TTL for the cached custom `404.html` lookup: the larger short-cache
+    // opt-in when either is set, else NOT_FOUND_PAGE_DEFAULT_TTL.
+    pub not_found_page_ttl: Duration,
+    // Concurrent chunked streaming reads (opendal `reader_with().concurrent()
+    // .chunk()`); `backend_read_concurrent <= 1` keeps sequential reads.
+    pub backend_read_concurrent: usize,
+    pub backend_read_chunk: u64,
     // opendal backend resilience (applied in storage.rs), all off by default so
     // local-FS setups keep current behavior; they matter for remote backends
     // (S3/FTP/GridFS) where a single op can hang or transiently fail.
@@ -101,7 +170,7 @@ pub struct Config {
     pub content_type_nosniff: bool,
     pub shutdown_delay: Duration,
     pub metrics_enabled: bool,
-    pub cors_allow_origin: Option<String>,
+    pub cors_allow_origin: Option<CorsAllowOrigin>,
     pub cors_allow_methods: String,
     pub cors_allow_headers: Option<String>,
     pub cors_max_age: Option<String>,
@@ -207,6 +276,23 @@ fn parse_bytesize_or_exit(name: &str, raw: Option<&str>, default: u64) -> u64 {
     }
 }
 
+// Optional byte size with no default: absent or empty -> None; present but
+// invalid (or zero, which would be a cache that can hold nothing) -> exit.
+fn parse_optional_bytesize_or_exit(name: &str, raw: Option<&str>) -> Option<u64> {
+    let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match s.parse::<bytesize::ByteSize>() {
+        Ok(b) if b.0 > 0 => Some(b.0),
+        Ok(_) => {
+            error!("Invalid {name}={s}: must be greater than zero");
+            std::process::exit(1)
+        }
+        Err(e) => {
+            error!("Invalid {name}={s}: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(default)]
 struct EnvConfig {
@@ -221,12 +307,15 @@ struct EnvConfig {
     fallback_index_404: bool,
     fallback_html_404: bool,
     cache_size: usize,
+    cache_max_bytes: Option<String>,
     cache_ttl: Option<String>,
     not_found_cache_ttl: Option<String>,
     html_cache_ttl: Option<String>,
     backend_retry_max: u32,
     backend_timeout: Option<String>,
     backend_io_timeout: Option<String>,
+    backend_read_concurrent: usize,
+    backend_read_chunk: Option<String>,
     startup_check: Option<String>,
     not_modified: bool,
     precompressed: bool,
@@ -265,12 +354,15 @@ impl Default for EnvConfig {
             fallback_index_404: false,
             fallback_html_404: false,
             cache_size: 1024,
+            cache_max_bytes: None,
             cache_ttl: None,
             not_found_cache_ttl: None,
             html_cache_ttl: None,
             backend_retry_max: 0,
             backend_timeout: None,
             backend_io_timeout: None,
+            backend_read_concurrent: 0,
+            backend_read_chunk: None,
             startup_check: None,
             not_modified: false,
             precompressed: false,
@@ -396,6 +488,19 @@ impl Config {
             std::process::exit(1)
         }
 
+        let not_found_cache_ttl = parse_short_cache_ttl_or_exit(
+            "STATIC_NOT_FOUND_CACHE_TTL",
+            env_cfg.not_found_cache_ttl.as_deref(),
+        );
+        let html_cache_ttl = parse_short_cache_ttl_or_exit(
+            "STATIC_HTML_CACHE_TTL",
+            env_cfg.html_cache_ttl.as_deref(),
+        );
+        let not_found_page_ttl = match not_found_cache_ttl.max(html_cache_ttl) {
+            ttl if ttl.is_zero() => NOT_FOUND_PAGE_DEFAULT_TTL,
+            ttl => ttl,
+        };
+
         Self {
             timeout: parse_duration_or_exit(
                 "STATIC_TIMEOUT",
@@ -412,19 +517,25 @@ impl Config {
             fallback_index_404: env_cfg.fallback_index_404,
             fallback_html_404: env_cfg.fallback_html_404,
             cache_size: env_cfg.cache_size,
+            cache_max_bytes: parse_optional_bytesize_or_exit(
+                "STATIC_CACHE_MAX_BYTES",
+                env_cfg.cache_max_bytes.as_deref(),
+            ),
             cache_ttl: parse_duration_or_exit(
                 "STATIC_CACHE_TTL",
                 env_cfg.cache_ttl.as_deref(),
                 Duration::from_secs(10 * 60),
             ),
-            not_found_cache_ttl: parse_short_cache_ttl_or_exit(
-                "STATIC_NOT_FOUND_CACHE_TTL",
-                env_cfg.not_found_cache_ttl.as_deref(),
-            ),
-            html_cache_ttl: parse_short_cache_ttl_or_exit(
-                "STATIC_HTML_CACHE_TTL",
-                env_cfg.html_cache_ttl.as_deref(),
-            ),
+            not_found_cache_ttl,
+            html_cache_ttl,
+            not_found_page_ttl,
+            backend_read_concurrent: env_cfg.backend_read_concurrent,
+            backend_read_chunk: parse_bytesize_or_exit(
+                "STATIC_BACKEND_READ_CHUNK",
+                env_cfg.backend_read_chunk.as_deref(),
+                BACKEND_READ_CHUNK_DEFAULT,
+            )
+            .max(1),
             backend_retry_max: env_cfg.backend_retry_max,
             backend_timeout: parse_optional_duration_or_exit(
                 "STATIC_BACKEND_TIMEOUT",
@@ -467,11 +578,49 @@ impl Config {
                 Duration::from_secs(5),
             ),
             metrics_enabled: env_cfg.metrics,
-            cors_allow_origin: env_cfg.cors_allow_origin.filter(|v| !v.trim().is_empty()),
+            cors_allow_origin: env_cfg
+                .cors_allow_origin
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| CorsAllowOrigin::parse(&v, env_cfg.cors_allow_credentials)),
             cors_allow_methods: env_cfg.cors_allow_methods,
             cors_allow_headers: env_cfg.cors_allow_headers.filter(|v| !v.trim().is_empty()),
             cors_max_age: env_cfg.cors_max_age,
             cors_allow_credentials: env_cfg.cors_allow_credentials,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_allow_origin_parses_once_into_a_policy() {
+        assert!(matches!(
+            CorsAllowOrigin::parse(" * ", false),
+            CorsAllowOrigin::Any
+        ));
+        assert!(matches!(
+            CorsAllowOrigin::parse("*", true),
+            CorsAllowOrigin::EchoAny
+        ));
+        // one usable entry (blank items ignored) is a fixed single origin
+        assert!(matches!(
+            CorsAllowOrigin::parse(" https://a.com , ", false),
+            CorsAllowOrigin::Single(v) if v == "https://a.com"
+        ));
+        // several entries form a trimmed allowlist
+        match CorsAllowOrigin::parse("https://a.com, https://b.com", false) {
+            CorsAllowOrigin::List(items) => {
+                let names: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
+                assert_eq!(names, ["https://a.com", "https://b.com"]);
+            }
+            other => panic!("expected an allowlist, got {other:?}"),
+        }
+        // an entry that can't be a header value is dropped, not fatal
+        assert!(matches!(
+            CorsAllowOrigin::parse("https://a.com, bad\u{7f}origin", false),
+            CorsAllowOrigin::Single(_)
+        ));
     }
 }

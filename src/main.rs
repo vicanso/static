@@ -23,10 +23,11 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, Uri, header};
 use axum::middleware::from_fn;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use axum::{Router, middleware::Next};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use config::{Config, StartupCheck};
+use config::{Config, CorsAllowOrigin, StartupCheck};
 use mimalloc::MiMalloc;
 use serve::{StaticServeParams, not_found_page, static_serve};
 
@@ -47,7 +48,7 @@ use tokio::signal;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{Predicate, SizeAbove};
-use tracing::{Level, error, info};
+use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 mod config;
@@ -182,7 +183,18 @@ async fn run(config: Arc<Config>) -> std::result::Result<(), Box<dyn std::error:
     // `x-original-size` header so it never reaches the client.
     let app = app.layer(from_fn(track_metrics));
 
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+    // TCP_NODELAY on every accepted connection (axum 0.8's `serve` leaves
+    // Nagle on). hyper already coalesces headers + small bodies into one write;
+    // what Nagle still delays is the tail segment of a streamed body and the
+    // next response on a keep-alive connection, which wait for the peer's
+    // (delayed, up to ~40ms) ACK.
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
+        .await?
+        .tap_io(|tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                warn!(error = %err, "failed to set TCP_NODELAY");
+            }
+        });
     info!("server running on http://{}", config.listen_addr);
 
     axum::serve(
@@ -241,6 +253,11 @@ where
         parts: &mut Parts,
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
+        // Already resolved by an outer middleware (access_log stores it) —
+        // don't re-parse the forwarded headers.
+        if let Some(ip) = parts.extensions.get::<ClientIp>() {
+            return Ok(*ip);
+        }
         let trusted = TRUST_PROXY.get().map(Vec::as_slice).unwrap_or(&[]);
         if !trusted.is_empty() {
             // Verified mode: forwarded headers count only when the direct peer
@@ -292,7 +309,9 @@ where
     }
 }
 
-async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> Response {
+async fn access_log(ClientIp(ip): ClientIp, mut req: Request<Body>, next: Next) -> Response {
+    // Hand the resolved IP down so the handler's ClientIp extractor reuses it.
+    req.extensions_mut().insert(ClientIp(ip));
     let method = req.method().clone();
     let uri = req.uri().clone();
 
@@ -308,7 +327,7 @@ async fn access_log(ClientIp(ip): ClientIp, req: Request<Body>, next: Next) -> R
 
     let size = response
         .headers()
-        .get(X_ORIGINAL_SIZE_HEADER_NAME.as_str())
+        .get(&X_ORIGINAL_SIZE_HEADER_NAME)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(-1);
@@ -339,15 +358,13 @@ async fn track_metrics(req: Request<Body>, next: Next) -> Response {
     if let Some(start) = start {
         let bytes = response
             .headers()
-            .get(X_ORIGINAL_SIZE_HEADER_NAME.as_str())
+            .get(&X_ORIGINAL_SIZE_HEADER_NAME)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         metrics::record_request(response.status().as_u16(), bytes, start.elapsed());
     }
-    response
-        .headers_mut()
-        .remove(X_ORIGINAL_SIZE_HEADER_NAME.as_str());
+    response.headers_mut().remove(&X_ORIGINAL_SIZE_HEADER_NAME);
     response
 }
 
@@ -376,44 +393,30 @@ fn method_not_allowed() -> Response {
 // — including when this request did not match. Without `Vary: Origin` on the
 // non-matching response, a shared cache could store the header-less rejection
 // and replay it to an allowed origin (or hand one origin's ACAO to another).
+// The policy is pre-parsed at startup, so this is a lookup plus at most one
+// header-value construction (the echoed origin).
 fn cors_origin(
-    allow_origin: Option<&str>,
-    allow_credentials: bool,
+    policy: Option<&CorsAllowOrigin>,
     origin: Option<&str>,
-) -> (Option<String>, bool) {
-    let Some(allow) = allow_origin else {
-        return (None, false);
-    };
-    let allow = allow.trim();
-    if allow == "*" {
+) -> (Option<HeaderValue>, bool) {
+    match policy {
+        None => (None, false),
+        Some(CorsAllowOrigin::Any) => (Some(HeaderValue::from_static("*")), false),
         // "*" is invalid alongside credentials — echo the request origin.
-        if allow_credentials {
-            return (origin.map(str::to_string), true);
+        Some(CorsAllowOrigin::EchoAny) => {
+            (origin.and_then(|o| HeaderValue::from_str(o).ok()), true)
         }
-        return (Some("*".to_string()), false);
+        // A single fixed origin is always advertised (no per-request
+        // variance), whether or not this request's origin equals it.
+        Some(CorsAllowOrigin::Single(v)) => (Some(v.clone()), false),
+        Some(CorsAllowOrigin::List(items)) => (
+            items
+                .iter()
+                .find(|(item, _)| origin == Some(item.as_str()))
+                .map(|(_, v)| v.clone()),
+            items.len() > 1,
+        ),
     }
-    let mut first = None;
-    let mut matched = None;
-    let mut count = 0usize;
-    for item in allow.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        count += 1;
-        if first.is_none() {
-            first = Some(item.to_string());
-        }
-        if matched.is_none() && origin == Some(item) {
-            matched = Some(item.to_string());
-        }
-    }
-    // A single fixed origin is always advertised (no per-request variance),
-    // whether or not this request's origin equals it.
-    if count == 1 {
-        return (first, false);
-    }
-    (matched, count > 1)
 }
 
 // Apply custom response headers, the nosniff default, and CORS headers to a
@@ -428,11 +431,7 @@ fn apply_common_headers(resp: &mut Response, config: &Config, origin: Option<&st
             HeaderValue::from_static("nosniff"),
         );
     }
-    let (acao, vary_origin) = cors_origin(
-        config.cors_allow_origin.as_deref(),
-        config.cors_allow_credentials,
-        origin,
-    );
+    let (acao, vary_origin) = cors_origin(config.cors_allow_origin.as_ref(), origin);
     // Vary applies whenever the config is origin-dependent, even on a
     // non-matching request whose response carries no ACAO at all.
     if vary_origin {
@@ -440,10 +439,8 @@ fn apply_common_headers(resp: &mut Response, config: &Config, origin: Option<&st
             .append(header::VARY, HeaderValue::from_static("Origin"));
     }
     if let Some(acao) = acao {
-        if let Ok(v) = HeaderValue::try_from(acao) {
-            resp.headers_mut()
-                .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
-        }
+        resp.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, acao);
         if config.cors_allow_credentials {
             resp.headers_mut().insert(
                 header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
@@ -457,18 +454,18 @@ fn cors_preflight(config: &Config, origin: Option<&str>) -> Response {
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = StatusCode::NO_CONTENT;
     apply_common_headers(&mut resp, config, origin);
-    if let Ok(v) = HeaderValue::try_from(config.cors_allow_methods.clone()) {
+    if let Ok(v) = HeaderValue::from_str(&config.cors_allow_methods) {
         resp.headers_mut()
             .insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
     }
     if let Some(h) = &config.cors_allow_headers
-        && let Ok(v) = HeaderValue::try_from(h.clone())
+        && let Ok(v) = HeaderValue::from_str(h)
     {
         resp.headers_mut()
             .insert(header::ACCESS_CONTROL_ALLOW_HEADERS, v);
     }
     if let Some(age) = &config.cors_max_age
-        && let Ok(v) = HeaderValue::try_from(age.clone())
+        && let Ok(v) = HeaderValue::from_str(age)
     {
         resp.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, v);
     }
@@ -512,14 +509,13 @@ async fn serve(
 
     let origin = req_headers
         .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string());
+        .and_then(|v| v.to_str().ok());
 
     // CORS preflight / method gating, before Basic Auth so a browser preflight
     // (which carries no credentials) is not rejected with 401.
     if method == Method::OPTIONS {
         if config.cors_allow_origin.is_some() {
-            return Ok(cors_preflight(&config, origin.as_deref()));
+            return Ok(cors_preflight(&config, origin));
         }
         return Ok(method_not_allowed());
     }
@@ -559,7 +555,7 @@ async fn serve(
             if let Ok(location) = HeaderValue::try_from(to.as_str()) {
                 resp.headers_mut().insert(header::LOCATION, location);
             }
-            apply_common_headers(&mut resp, &config, origin.as_deref());
+            apply_common_headers(&mut resp, &config, origin);
             return Ok(resp);
         }
     }
@@ -656,7 +652,7 @@ async fn serve(
         params.file = current_file;
         match static_serve(&params).await {
             Ok(mut response) => {
-                apply_common_headers(&mut response, &config, origin.as_deref());
+                apply_common_headers(&mut response, &config, origin);
                 return Ok(response);
             }
             Err(e) if e.is_not_found() => {
@@ -666,12 +662,11 @@ async fn serve(
         }
     }
     // Try serving custom error page (404.html in the storage root). The lookup
-    // — page body or its absence — is cached by serve::not_found_page whenever
-    // either short-cache TTL opted in, so path-scanning bots don't turn every
-    // 404 into a backend round trip.
+    // — page body or its absence — is cached by serve::not_found_page (10s by
+    // default, or the larger short-cache opt-in), so path-scanning bots don't
+    // turn every 404 into a backend round trip.
     if last_err.is_not_found()
-        && let Some(body) =
-            not_found_page(config.not_found_cache_ttl.max(config.html_cache_ttl)).await
+        && let Some(body) = not_found_page(config.not_found_page_ttl).await
     {
         let mut resp = body.into_response();
         *resp.status_mut() = StatusCode::NOT_FOUND;
@@ -681,7 +676,7 @@ async fn serve(
         );
         resp.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        apply_common_headers(&mut resp, &config, origin.as_deref());
+        apply_common_headers(&mut resp, &config, origin);
         return Ok(resp);
     }
     Err(last_err)
@@ -723,6 +718,36 @@ fn init_logger() {
     }
 }
 
+// IP access control and rate limiting key on ClientIp, which — with
+// STATIC_TRUST_PROXY unset — believes X-Forwarded-For from anyone. A client
+// reaching the server directly can then pick its own IP: walk past an
+// allowlist, dodge a blocklist, or reset its rate-limit bucket on every
+// request. That default is kept for compatibility, but say so loudly when a
+// feature that depends on the IP is switched on.
+fn warn_spoofable_client_ip(config: &Config) {
+    if !config.trust_proxy.is_empty() {
+        return;
+    }
+    let mut features = Vec::new();
+    if !config.ip_allowlist.is_empty() {
+        features.push("STATIC_IP_ALLOWLIST");
+    }
+    if !config.ip_blocklist.is_empty() {
+        features.push("STATIC_IP_BLOCKLIST");
+    }
+    if config.rate_limit > 0 {
+        features.push("STATIC_RATE_LIMIT");
+    }
+    if !features.is_empty() {
+        warn!(
+            features = ?features,
+            "client IP is taken from X-Forwarded-For / X-Real-Ip without verification; \
+             any client that can reach this server directly can spoof it. Set \
+             STATIC_TRUST_PROXY to your proxy addresses to verify forwarded headers"
+        );
+    }
+}
+
 fn main() {
     init_logger();
     let config = Arc::new(Config::new());
@@ -734,8 +759,14 @@ fn main() {
         config.backend_timeout,
         config.backend_io_timeout,
     );
+    storage::init_read_tuning(
+        config.backend_read_concurrent,
+        config.backend_read_chunk as usize,
+    );
     metrics::set_enabled(config.metrics_enabled);
     metrics::set_cache_capacity(config.cache_size);
+    serve::init_cache(config.cache_size, config.cache_max_bytes);
+    warn_spoofable_client_ip(&config);
     info!(
         config = ?config,
         "starting static server",
@@ -765,6 +796,17 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("valid test ip")
+    }
+
+    // Parse the policy exactly as Config does, then resolve one request.
+    fn cors(
+        allow: Option<&str>,
+        credentials: bool,
+        origin: Option<&str>,
+    ) -> (Option<String>, bool) {
+        let policy = allow.map(|a| CorsAllowOrigin::parse(a, credentials));
+        let (acao, vary) = cors_origin(policy.as_ref(), origin);
+        (acao.and_then(|v| v.to_str().ok().map(str::to_string)), vary)
     }
 
     #[test]
@@ -812,17 +854,17 @@ mod tests {
     fn cors_origin_wildcard() {
         // "*" without credentials never varies
         assert_eq!(
-            cors_origin(Some("*"), false, Some("https://a.com")),
+            cors(Some("*"), false, Some("https://a.com")),
             (Some("*".to_string()), false)
         );
         // "*" with credentials echoes the request origin and always varies —
         // even when no Origin was sent (the header-less response must not be
         // cached as the canonical variant)
         assert_eq!(
-            cors_origin(Some("*"), true, Some("https://a.com")),
+            cors(Some("*"), true, Some("https://a.com")),
             (Some("https://a.com".to_string()), true)
         );
-        assert_eq!(cors_origin(Some("*"), true, None), (None, true));
+        assert_eq!(cors(Some("*"), true, None), (None, true));
     }
 
     #[test]
@@ -830,15 +872,15 @@ mod tests {
         let allow = Some("https://a.com");
         // always advertised, matching or not
         assert_eq!(
-            cors_origin(allow, false, Some("https://a.com")),
+            cors(allow, false, Some("https://a.com")),
             (Some("https://a.com".to_string()), false)
         );
         assert_eq!(
-            cors_origin(allow, false, Some("https://evil.com")),
+            cors(allow, false, Some("https://evil.com")),
             (Some("https://a.com".to_string()), false)
         );
         assert_eq!(
-            cors_origin(allow, false, None),
+            cors(allow, false, None),
             (Some("https://a.com".to_string()), false)
         );
     }
@@ -848,24 +890,18 @@ mod tests {
         let allow = Some("https://a.com, https://b.com");
         // a match echoes the origin and varies
         assert_eq!(
-            cors_origin(allow, false, Some("https://b.com")),
+            cors(allow, false, Some("https://b.com")),
             (Some("https://b.com".to_string()), true)
         );
         // a non-match still varies: the ACAO-less rejection is origin-dependent
         // and must not be cached as the response for every origin
-        assert_eq!(
-            cors_origin(allow, false, Some("https://evil.com")),
-            (None, true)
-        );
-        assert_eq!(cors_origin(allow, false, None), (None, true));
+        assert_eq!(cors(allow, false, Some("https://evil.com")), (None, true));
+        assert_eq!(cors(allow, false, None), (None, true));
     }
 
     #[test]
     fn cors_origin_disabled() {
-        assert_eq!(
-            cors_origin(None, false, Some("https://a.com")),
-            (None, false)
-        );
+        assert_eq!(cors(None, false, Some("https://a.com")), (None, false));
     }
 
     #[test]
